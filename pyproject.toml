@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "Linki"
+version = "0.1.0"
+description = "A Typer CLI agent scaffold with workspace-restricted tools."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "langchain-core>=0.3",
+    "langchain-openai>=0.2",
+    "python-dotenv>=1.0",
+    "typer>=0.12",
+]
+
+[project.scripts]
+Linki = "Linki.cli.app:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/Linki"]
