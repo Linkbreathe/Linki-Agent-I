@@ -5,12 +5,15 @@ from typing import Annotated
 from rich.console import Console
 from rich.panel import Panel
 from rich.syntax import Syntax
+from rich.table import Table
 import typer
 
 from Linki.core.agent import stream_agent_events
 
 app = typer.Typer(no_args_is_help=True)
 console = Console()
+
+STATUS_ICONS = {"pending": "⏳", "in_progress": "🔄", "completed": "✅", "blocked": "🚫"}
 
 
 def _json_block(value: object) -> Syntax:
@@ -19,6 +22,26 @@ def _json_block(value: object) -> Syntax:
         "json",
         word_wrap=True,
     )
+
+
+def _todos_table(todos: list[dict]) -> Table:
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("Status")
+    table.add_column("Todo")
+    table.add_column("Note")
+    for todo in todos:
+        table.add_row(f"{STATUS_ICONS[todo['status']]} {todo['status']}", todo["content"], todo["note"])
+    return table
+
+
+def _checks_table(checks: list[dict]) -> Table:
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("")
+    table.add_column("Check")
+    table.add_column("Detail")
+    for check in checks:
+        table.add_row("✅" if check["passed"] else "❌", check["name"], check["detail"])
+    return table
 
 
 def _print_event(event: dict) -> None:
@@ -30,7 +53,14 @@ def _print_event(event: dict) -> None:
         content = str(event.get("content", ""))
 
         if node == "planner":
-            console.print(Panel(_json_block(data), title="📋 Planner", border_style="blue"))
+            console.print(
+                Panel(
+                    _todos_table(data["todos"]),
+                    title="📋 Planner",
+                    subtitle=data["plan_summary"],
+                    border_style="blue",
+                )
+            )
             return
 
         if node == "actor":
@@ -38,10 +68,10 @@ def _print_event(event: dict) -> None:
             return
 
         if node == "verifier":
-            passed = bool(data.get("passed")) if isinstance(data, dict) else False
+            passed = bool(data["passed"])
             title = "✅ Verifier" if passed else "❌ Verifier"
             border_style = "green" if passed else "red"
-            console.print(Panel(_json_block(data), title=title, border_style=border_style))
+            console.print(Panel(_checks_table(data["verification_checks"]), title=title, border_style=border_style))
             return
 
         if node == "final":
