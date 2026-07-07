@@ -1,3 +1,5 @@
+import json
+
 from langchain_core.tools import StructuredTool
 
 from Linki.core.state import RuntimeState
@@ -40,7 +42,7 @@ def build_tools(state: RuntimeState) -> list[StructuredTool]:
         )
 
     def bash_tool(command: str, timeout_seconds: int = 30) -> str:
-        return bash(command=command, timeout_seconds=timeout_seconds)
+        return json.dumps(bash(command=command, timeout_seconds=timeout_seconds), ensure_ascii=False)
 
     return [
         StructuredTool.from_function(
