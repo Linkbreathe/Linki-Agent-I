@@ -1,62 +1,115 @@
 import json
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
-from langchain_core.tools import StructuredTool
+from langchain_core.messages import BaseMessage
 
 from Linki.core.paths import ensure_workspace
 from Linki.core.state import RuntimeState
+from Linki.graph.workflow import build_workflow
 from Linki.providers.openai_provider import create_model
-from Linki.tools.registry import build_tools
-
-ACTOR_PROMPT = """You are the actor node in Linki's ReAct workflow.
-
-You implement the user's task using tools. Work inside the workspace only.
-
-Rules:
-- Use FileWriteTool for new files.
-- Use FileReadTool before editing existing files.
-- Use FileEditTool for focused edits.
-- Use BashTool to run commands and test results.
-- BashTool already runs inside the workspace. Use relative paths, never "cd /workspace".
-- End with a concise summary of files changed and commands run.
-"""
 
 
-def _message_content(message: Any) -> str:
+def _message_content(message: BaseMessage) -> str:
     content = getattr(message, "content", "")
     if isinstance(content, str):
         return content
     return json.dumps(content, ensure_ascii=False)
 
 
-def _execute_tool(call: dict, tools_by_name: dict[str, StructuredTool]) -> dict:
-    name = call["name"]
-    tool = tools_by_name.get(name)
-    if tool is None:
-        return {
-            "ok": False,
-            "name": name,
-            "error_type": "UnknownTool",
-            "error": f"Unknown tool: {name}",
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, BaseMessage):
+        data = {
+            "type": getattr(value, "type", type(value).__name__),
+            "content": _message_content(value),
         }
+        tool_calls = getattr(value, "tool_calls", None)
+        if tool_calls:
+            data["tool_calls"] = tool_calls
+        return data
+
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+
+    if isinstance(value, tuple):
+        return [_json_safe(item) for item in value]
+
+    if isinstance(value, Path):
+        return str(value)
 
     try:
-        output = tool.invoke(call.get("args", {}))
-    except Exception as exc:
-        return {
-            "ok": False,
-            "name": name,
-            "error_type": type(exc).__name__,
-            "error": str(exc),
-        }
+        json.dumps(value)
+    except TypeError:
+        return str(value)
+    return value
 
+
+def _content_for_node(node: str, update: Mapping[str, Any]) -> str:
+    if node == "planner":
+        return str(update.get("plan_summary", ""))
+
+    if node == "actor":
+        return str(update.get("last_actor_summary", ""))
+
+    if node == "verifier":
+        passed = bool(update.get("passed"))
+        reason = "passed" if passed else "failed"
+        checks = update.get("verification_checks") or []
+        return f"Verification {reason}. Checks: {len(checks)}"
+
+    if node == "final":
+        return str(update.get("final_answer", ""))
+
+    return ""
+
+
+def _node_update_event(node: str, update: Mapping[str, Any]) -> dict:
+    safe_update = _json_safe(update)
     return {
-        "ok": True,
-        "name": name,
-        "output": output,
+        "type": "node_update",
+        "node": node,
+        "content": _content_for_node(node, update),
+        "data": safe_update,
+    }
+
+
+def _parse_graph_event(raw_event: Any) -> Iterator[dict]:
+    if isinstance(raw_event, tuple) and len(raw_event) == 2:
+        mode, payload = raw_event
+    else:
+        mode, payload = "updates", raw_event
+
+    if mode == "updates" and isinstance(payload, Mapping):
+        for node, update in payload.items():
+            if isinstance(update, Mapping):
+                yield _node_update_event(str(node), update)
+            else:
+                yield {
+                    "type": "node_update",
+                    "node": str(node),
+                    "content": "",
+                    "data": _json_safe(update),
+                }
+        return
+
+    if mode == "custom":
+        if isinstance(payload, Mapping):
+            event = dict(payload)
+            event.setdefault("type", "custom")
+            event["data"] = _json_safe(event.get("data", payload))
+            yield _json_safe(event)
+        else:
+            yield {"type": "custom", "data": _json_safe(payload)}
+        return
+
+    yield {
+        "type": "graph_event",
+        "mode": str(mode),
+        "data": _json_safe(payload),
     }
 
 
@@ -64,64 +117,26 @@ def stream_agent_events(
     task: str,
     *,
     workspace: str | Path,
-    max_loops: int = 10,
+    max_attempts: int = 3,
     provider: str = "openai",
     model_name: str | None = None,
     model: Any | None = None,
 ) -> Iterator[dict]:
-    """Stream events from Linki's ReAct tool-calling loop."""
+    """Stream normalized events from Linki's LangGraph workflow."""
 
-    state = RuntimeState(workspace=Path(workspace))
-    ensure_workspace(state, create=True)
+    runtime = RuntimeState(workspace=Path(workspace))
+    ensure_workspace(runtime, create=True)
 
-    tools = build_tools(state)
-    tools_by_name = {tool.name: tool for tool in tools}
-    chat_model = model or create_model(provider=provider, model=model_name)
-    agent = chat_model.bind_tools(tools)
-    messages = [
-        SystemMessage(content=ACTOR_PROMPT),
-        HumanMessage(content=task),
-    ]
-
-    last_ai_content = ""
-    for _ in range(max_loops):
-        response = agent.invoke(messages)
-        messages.append(response)
-        last_ai_content = _message_content(response)
-
-        yield {
-            "type": "ai_message",
-            "content": last_ai_content,
-        }
-
-        tool_calls = getattr(response, "tool_calls", None) or []
-        if not tool_calls:
-            break
-
-        for call in tool_calls:
-            name = call["name"]
-            args = call.get("args", {})
-            yield {
-                "type": "tool_call",
-                "name": name,
-                "args": args,
-            }
-
-            result = _execute_tool(call, tools_by_name)
-            messages.append(
-                ToolMessage(
-                    content=json.dumps(result, ensure_ascii=False),
-                    tool_call_id=call["id"],
-                )
-            )
-
-            yield {
-                "type": "tool_result",
-                "name": name,
-                "result": result,
-            }
-
-    yield {
-        "type": "final_answer",
-        "content": last_ai_content,
+    inputs = {
+        "task": task,
+        "runtime": runtime,
+        "attempts": 0,
+        "max_attempts": max_attempts,
+        "provider": provider,
+        "model_name": model_name,
+        "model": model or create_model(provider=provider, model=model_name),
     }
+
+    workflow = build_workflow()
+    for raw_event in workflow.stream(inputs, stream_mode=["updates", "custom"]):
+        yield from _parse_graph_event(raw_event)

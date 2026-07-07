@@ -69,3 +69,41 @@ def build_tools(state: RuntimeState) -> list[StructuredTool]:
             description="Run a bash command with the workspace as the working directory and a timeout.",
         ),
     ]
+
+
+def build_read_only_tools(state: RuntimeState) -> list[StructuredTool]:
+    """Build read-only Linki tools for verifier model.bind_tools()."""
+
+    file_read = FileReadTool(state)
+    grep = GrepTool(state)
+
+    def file_read_tool(file_path: str, offset: int = 0, limit: int | None = None) -> str:
+        return file_read(file_path=file_path, offset=offset, limit=limit)
+
+    def grep_tool(
+        pattern: str,
+        path: str = ".",
+        glob: str | None = None,
+        head_limit: int = 50,
+        ignore_case: bool = False,
+    ) -> str:
+        return grep(
+            pattern=pattern,
+            path=path,
+            glob=glob,
+            head_limit=head_limit,
+            ignore_case=ignore_case,
+        )
+
+    return [
+        StructuredTool.from_function(
+            func=file_read_tool,
+            name="FileReadTool",
+            description="Read a UTF-8 text file within the workspace. Supports line offset and limit.",
+        ),
+        StructuredTool.from_function(
+            func=grep_tool,
+            name="GrepTool",
+            description="Search files within the workspace using a regular expression.",
+        ),
+    ]

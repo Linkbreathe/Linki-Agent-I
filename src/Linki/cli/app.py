@@ -24,6 +24,33 @@ def _json_block(value: object) -> Syntax:
 def _print_event(event: dict) -> None:
     event_type = event.get("type")
 
+    if event_type == "node_update":
+        node = event.get("node")
+        data = event.get("data", {})
+        content = str(event.get("content", ""))
+
+        if node == "planner":
+            console.print(Panel(_json_block(data), title="📋 Planner", border_style="blue"))
+            return
+
+        if node == "actor":
+            console.print(Panel(content or _json_block(data), title="🔧 Actor", border_style="cyan"))
+            return
+
+        if node == "verifier":
+            passed = bool(data.get("passed")) if isinstance(data, dict) else False
+            title = "✅ Verifier" if passed else "❌ Verifier"
+            border_style = "green" if passed else "red"
+            console.print(Panel(_json_block(data), title=title, border_style=border_style))
+            return
+
+        if node == "final":
+            console.print(Panel(content or _json_block(data), title="📝 Final", border_style="magenta"))
+            return
+
+        console.print(Panel(_json_block(data), title=f"Node: {node}", border_style="white"))
+        return
+
     if event_type == "tool_call":
         console.print(
             Panel(
@@ -77,13 +104,13 @@ def main(
             help="Override the provider default model.",
         ),
     ] = None,
-    max_loops: Annotated[
+    max_attempts: Annotated[
         int,
         typer.Option(
-            "--max-loops",
-            help="Maximum number of ReAct loops to run.",
+            "--max-attempts",
+            help="Maximum planner/actor/verifier attempts to run.",
         ),
-    ] = 10,
+    ] = 3,
 ) -> None:
     provider_name = provider.lower()
     if provider_name not in {"openai", "deepseek"}:
@@ -93,7 +120,7 @@ def main(
         for event in stream_agent_events(
             task,
             workspace=workspace,
-            max_loops=max_loops,
+            max_attempts=max_attempts,
             provider=provider_name,
             model_name=model,
         ):
