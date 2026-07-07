@@ -6,6 +6,7 @@ from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, To
 from pydantic import BaseModel, Field
 
 from Linki.core.state import RuntimeState
+from Linki.graph.memory import LayeredMemory, build_layered_memory, format_layered_memory_for_prompt, memory_event
 from Linki.graph.state import TodoItem
 from Linki.providers.openai_provider import create_model
 from Linki.tools.registry import build_tools
@@ -105,16 +106,6 @@ def _update_todo(todos: list[TodoItem], todo_id: str, status: str, note: str) ->
     raise ValueError(f"Unknown todo id: {todo_id}")
 
 
-def _build_memory_snapshot(state: Any) -> str:
-    """Placeholder for the layered-memory snapshot (short-term/long-term/notepad).
-
-    TODO: wire up real layered memory (backed by NotepadAppendTool /
-    NotepadReadTool) in a later phase. Returning an empty string keeps the
-    call site and message layout stable until that lands.
-    """
-    return ""
-
-
 def _session_context(state: Any) -> str:
     values = state if isinstance(state, Mapping) else {}
     context: dict[str, Any] = {
@@ -137,15 +128,14 @@ def _session_context(state: Any) -> str:
     return _format_json(context)
 
 
-def _build_human_message(state: Any, instruction: str, memory_snapshot: str) -> str:
+def _code_agent_input(state: Any, instruction: str, memory: LayeredMemory) -> str:
     values = state if isinstance(state, Mapping) else {}
     parts = [
         f"Task:\n{values.get('task', '')}",
         f"Instruction:\n{instruction}",
         f"Session context:\n{_session_context(state)}",
+        format_layered_memory_for_prompt(memory),
     ]
-    if memory_snapshot:
-        parts.append(f"Memory snapshot:\n{memory_snapshot}")
 
     return "\n\n".join(parts)
 
@@ -208,10 +198,13 @@ def run_code_agent(
 
     agent = _model(state).bind_tools(tools + [TodoUpdateTool])
 
-    memory_snapshot = _build_memory_snapshot(state)
+    memory = build_layered_memory(state, node="codeAgent")
+    if writer is not None:
+        writer(memory_event(memory, node="codeAgent"))
+
     messages: list[BaseMessage] = [
         SystemMessage(content=CODE_AGENT_PROMPT),
-        HumanMessage(content=_build_human_message(state, instruction, memory_snapshot)),
+        HumanMessage(content=_code_agent_input(state, instruction, memory)),
     ]
 
     tool_events: list[dict[str, Any]] = []

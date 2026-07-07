@@ -4,23 +4,36 @@ import subprocess
 from collections.abc import Iterable, Iterator, Mapping
 from typing import Any, cast
 
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from langgraph.config import get_stream_writer
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from pydantic import BaseModel, Field
 
 from Linki.agents.code_agent import run_code_agent
 from Linki.agents.search_agent import run_search_agent
-from Linki.core.paths import ensure_workspace
+from Linki.core.paths import ensure_workspace, resolve_workspace_path
 from Linki.core.state import RuntimeState
+from Linki.graph.memory import (
+    HISTORY_SUMMARY_FILENAME,
+    CompressionEvent,
+    LayeredMemory,
+    _short_text,
+    _trim_handoffs,
+    build_layered_memory,
+    format_layered_memory_for_prompt,
+    memory_event,
+)
 from Linki.graph.state import AgentHandoff, LinkiGraphState, SourceItem, TodoItem, VerificationCheck, VerificationResult
 from Linki.providers.openai_provider import create_model
 from Linki.prompts.stage3 import PLANNER_PROMPT, VERIFIER_PROMPT
+from Linki.prompts.stage4 import CONTEXT_COMPRESSION_PROMPT
 from Linki.tools.bash_tool import _decode_timeout_output, _validate_workspace_command
 from Linki.tools.registry import build_read_only_tools, build_tools
 
 
 TODO_STATUSES = {"pending", "in_progress", "completed", "blocked"}
+CONTEXT_TOKEN_LIMIT_DEFAULT = 400_000
 
 
 class TodoItemSchema(BaseModel):
@@ -341,11 +354,33 @@ def _build_planner_tools(working: dict[str, Any]) -> list[StructuredTool]:
     ]
 
 
+def _planner_input(working_state: Mapping[str, Any], memory: LayeredMemory) -> str:
+    failed_previous_verification = working_state.get("passed") is False or bool(working_state.get("last_error"))
+
+    if failed_previous_verification:
+        instruction = "\n".join(
+            [
+                "Revise the existing plan based on the verifier failure, then delegate only the missing fix.",
+                f"Task:\n{working_state.get('task', '')}",
+                f"Last error:\n{working_state.get('last_error', '')}",
+                f"Current plan:\n{_plan_context(working_state)}",
+            ]
+        )
+    else:
+        instruction = "\n".join(
+            [
+                "Plan this task and delegate the needed work to the specialist agents.",
+                f"Task:\n{working_state.get('task', '')}",
+            ]
+        )
+
+    return "\n\n".join([instruction, format_layered_memory_for_prompt(memory)])
+
+
 def planner_node(state: LinkiGraphState) -> dict:
     """Run the planner/supervisor node: publish the plan and delegate to searchAgent/codeAgent."""
 
     runtime = _runtime(state)
-    failed_previous_verification = state.get("passed") is False or bool(state.get("last_error"))
 
     working: dict[str, Any] = {
         "task": state.get("task", ""),
@@ -362,32 +397,24 @@ def planner_node(state: LinkiGraphState) -> dict:
         "agent_handoffs": list(state.get("agent_handoffs", [])),
         "code_agent_summary": state.get("code_agent_summary", ""),
         "messages": list(state.get("messages", [])),
+        "passed": state.get("passed"),
+        "last_error": state.get("last_error", ""),
+        "attempts": state.get("attempts", 0),
+        "max_attempts": state.get("max_attempts", 3),
+        "context_summary": state.get("context_summary", ""),
+        "compression_events": list(state.get("compression_events", [])),
     }
-
-    if failed_previous_verification:
-        supervisor_prompt = "\n".join(
-            [
-                "Revise the existing plan based on the verifier failure, then delegate only the missing fix.",
-                f"Task:\n{working['task']}",
-                f"Last error:\n{state.get('last_error', '')}",
-                f"Current plan:\n{_plan_context(state)}",
-            ]
-        )
-    else:
-        supervisor_prompt = "\n".join(
-            [
-                "Plan this task and delegate the needed work to the specialist agents.",
-                f"Task:\n{working['task']}",
-            ]
-        )
 
     tools = _build_planner_tools(working)
     tools_by_name = {tool.name: tool for tool in tools}
     agent = _model(state).bind_tools(tools)
 
+    memory = build_layered_memory(working, node="planner")
+    _emit_custom_event(memory_event(memory, node="planner"))
+
     messages: list[BaseMessage] = [
         SystemMessage(content=PLANNER_PROMPT),
-        HumanMessage(content=supervisor_prompt),
+        HumanMessage(content=_planner_input(working, memory)),
     ]
 
     supervisor_summary = ""
@@ -406,6 +433,7 @@ def planner_node(state: LinkiGraphState) -> dict:
         "code_agent_summary": working["code_agent_summary"],
         "messages": working["messages"],
         "last_actor_summary": working["code_agent_summary"] or supervisor_summary,
+        "context_next_node": "verifier",
     }
 
 
@@ -504,6 +532,20 @@ def _verified_todos(todos: list[TodoItem], passed: bool, last_error: str) -> lis
     return updated
 
 
+def _verifier_input(working_state: Mapping[str, Any], memory: LayeredMemory) -> str:
+    instruction = "\n".join(
+        [
+            f"Task:\n{working_state.get('task', '')}",
+            f"Plan:\n{_plan_context(working_state)}",
+            f"Acceptance criteria:\n{_format_json(working_state.get('acceptance_criteria', []))}",
+            f"Verification commands:\n{_format_json(working_state.get('verification_commands', []))}",
+            f"Verification command results:\n{_format_json(working_state.get('verification_results', []))}",
+            f"Latest actor output:\n{working_state.get('last_actor_summary', '')}",
+        ]
+    )
+    return "\n\n".join([instruction, format_layered_memory_for_prompt(memory)])
+
+
 def verifier_node(state: LinkiGraphState) -> dict:
     """Verify actor output, run verification commands, and update graph status."""
 
@@ -516,19 +558,14 @@ def verifier_node(state: LinkiGraphState) -> dict:
     tools = build_read_only_tools(runtime)
     tools_by_name = {tool.name: tool for tool in tools}
     agent = _model(state).bind_tools(tools)
-    verifier_input = "\n".join(
-        [
-            f"Task:\n{state.get('task', '')}",
-            f"Plan:\n{_plan_context(state)}",
-            f"Acceptance criteria:\n{_format_json(state.get('acceptance_criteria', []))}",
-            f"Verification commands:\n{_format_json(state.get('verification_commands', []))}",
-            f"Verification command results:\n{_format_json(verification_results)}",
-            f"Latest actor output:\n{state.get('last_actor_summary', '')}",
-        ]
-    )
+
+    working_state: dict[str, Any] = {**state, "verification_results": verification_results}
+    memory = build_layered_memory(working_state, node="verifier")
+    _emit_custom_event(memory_event(memory, node="verifier"))
+
     messages: list[BaseMessage] = [
         SystemMessage(content=VERIFIER_PROMPT),
-        HumanMessage(content=verifier_input),
+        HumanMessage(content=_verifier_input(working_state, memory)),
     ]
 
     final_content = ""
@@ -557,6 +594,7 @@ def verifier_node(state: LinkiGraphState) -> dict:
     }
     if not passed:
         updates["last_error"] = last_error
+        updates["context_next_node"] = "planner"
     return updates
 
 
@@ -568,6 +606,110 @@ def verifier_route(state: LinkiGraphState) -> str:
         return "final"
 
     return "planner"
+
+
+def _messages_text(messages: Iterable[BaseMessage]) -> str:
+    return "\n".join(_message_content(message) for message in messages)
+
+
+def _estimate_token_count(model: Any, messages: list[BaseMessage], memory_payload: str) -> int:
+    payload_message = HumanMessage(content=memory_payload)
+    try:
+        return model.get_num_tokens_from_messages(messages + [payload_message])
+    except Exception:
+        text = _messages_text(messages) + memory_payload
+        return len(text) // 4
+
+
+def context_monitor_node(state: LinkiGraphState) -> dict:
+    """Estimate context token usage and flag whether compression is required."""
+
+    model = _model(state)
+    messages = list(state.get("messages", []))
+    memory_payload = format_layered_memory_for_prompt(build_layered_memory(state, node="context_monitor"))
+
+    token_count = _estimate_token_count(model, messages, memory_payload)
+    token_limit = int(state.get("context_token_limit") or CONTEXT_TOKEN_LIMIT_DEFAULT)
+    should_compress = token_count > token_limit
+
+    return {
+        "context_token_count": token_count,
+        "context_should_compress": should_compress,
+        "context_next_node": state.get("context_next_node", "verifier"),
+    }
+
+
+def context_monitor_route(state: LinkiGraphState) -> str:
+    if state.get("passed"):
+        return "final"
+
+    if state.get("context_should_compress"):
+        return "context_compressor"
+
+    return state.get("context_next_node", "verifier")
+
+
+def context_compressor_node(state: LinkiGraphState) -> dict:
+    """Compress the message history and durable context into one summary."""
+
+    runtime = _runtime(state)
+    model = _model(state)
+    messages = list(state.get("messages", []))
+    memory_payload = format_layered_memory_for_prompt(
+        build_layered_memory(state, node="context_compressor")
+    )
+
+    compression_input = "\n\n".join(
+        [
+            f"Current messages:\n{_format_json([_message_content(message) for message in messages])}",
+            f"Layered memory snapshot:\n{memory_payload}",
+        ]
+    )
+
+    response = model.invoke(
+        [
+            SystemMessage(content=CONTEXT_COMPRESSION_PROMPT),
+            HumanMessage(content=compression_input),
+        ]
+    )
+    response_text = _message_content(response)
+    payload = _json_from_text(response_text)
+    summary = _format_json(payload) if payload else response_text
+
+    resolve_workspace_path(runtime, HISTORY_SUMMARY_FILENAME).write_text(summary, encoding="utf-8")
+
+    new_token_count = _estimate_token_count(model, [AIMessage(content=summary)], "")
+
+    compression_event: CompressionEvent = {
+        "node": "context_compressor",
+        "reason": "context_token_count exceeded context_token_limit",
+        "token_count": int(state.get("context_token_count", 0)),
+        "token_limit": int(state.get("context_token_limit") or CONTEXT_TOKEN_LIMIT_DEFAULT),
+        "summary": _short_text(summary, 400),
+    }
+
+    return {
+        "messages": [
+            RemoveMessage(id=REMOVE_ALL_MESSAGES),
+            AIMessage(content=summary),
+        ],
+        "context_summary": summary,
+        "context_token_count": new_token_count,
+        "context_should_compress": False,
+        "research_notes": _short_text(state.get("research_notes", ""), 1600),
+        "agent_handoffs": _trim_handoffs(state.get("agent_handoffs", [])),
+        "code_agent_summary": _short_text(state.get("code_agent_summary", ""), 1000),
+        "last_actor_summary": _short_text(state.get("last_actor_summary", ""), 1000),
+        "last_error": _short_text(state.get("last_error", ""), 1400),
+        "history_summary": summary,
+        "compression_events": [*state.get("compression_events", []), compression_event],
+    }
+
+
+def context_compressor_route(state: LinkiGraphState) -> str:
+    """Route to the node selected before compression."""
+
+    return state.get("context_next_node", "verifier")
 
 
 def final_node(state: LinkiGraphState) -> dict:

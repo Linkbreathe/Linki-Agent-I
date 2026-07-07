@@ -7,7 +7,7 @@ from langchain_core.messages import BaseMessage
 
 from Linki.core.paths import ensure_workspace
 from Linki.core.state import RuntimeState
-from Linki.graph.workflow import build_workflow
+from Linki.graph.workflow import build_complex_workflow
 from Linki.providers.openai_provider import create_model
 
 
@@ -138,6 +138,6 @@ def stream_agent_events(
         "model": model or create_model(provider=provider, model=model_name),
     }
 
-    workflow = build_workflow()
+    workflow = build_complex_workflow()
     for raw_event in workflow.stream(inputs, stream_mode=["updates", "custom"]):
         yield from _parse_graph_event(raw_event)

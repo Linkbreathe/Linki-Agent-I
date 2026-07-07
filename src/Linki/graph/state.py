@@ -4,6 +4,7 @@ from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
 
 from Linki.core.state import RuntimeState
+from Linki.graph.memory import CompressionEvent, LayeredMemory
 
 
 class TodoItem(TypedDict):
@@ -64,3 +65,11 @@ class LinkiGraphState(TypedDict, total=False):
     last_error: str
     last_actor_summary: str
     final_answer: str
+    context_summary: str
+    context_token_count: int
+    context_token_limit: int
+    context_should_compress: bool
+    context_next_node: str
+    compression_events: list[CompressionEvent]
+    memory_snapshot: LayeredMemory
+    history_summary: str

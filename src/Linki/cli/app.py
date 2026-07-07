@@ -24,6 +24,44 @@ def _json_block(value: object) -> Syntax:
     )
 
 
+def _truncate(text: str, limit: int = 200) -> str:
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "…"
+
+
+def _memory_table(memory: dict) -> Table:
+    working = memory.get("working_memory") or {}
+    history = memory.get("history_summary_store") or {}
+
+    todos = working.get("todos") or []
+    status_counts: dict[str, int] = {}
+    for todo in todos:
+        status = todo.get("status", "pending") if isinstance(todo, dict) else "pending"
+        status_counts[status] = status_counts.get(status, 0) + 1
+    todos_summary = ", ".join(f"{count} {status}" for status, count in status_counts.items()) or "none"
+
+    table = Table(show_header=False, box=None, padding=(0, 1))
+    table.add_column(style="bold", no_wrap=True)
+    table.add_column()
+
+    table.add_row("Plan", _truncate(str(working.get("plan_summary") or "—")))
+    table.add_row("Todos", f"{len(todos)} ({todos_summary})")
+    table.add_row("Acceptance criteria", str(len(working.get("acceptance_criteria") or [])))
+    table.add_row("Verification commands", str(len(working.get("verification_commands") or [])))
+    table.add_row("Sources", str(len(working.get("sources") or [])))
+    table.add_row("Agent handoffs", str(len(working.get("agent_handoffs") or [])))
+    table.add_row("Attempts", f"{working.get('attempts', 0)}/{working.get('max_attempts', 0)}")
+    if working.get("last_error"):
+        table.add_row("Last error", _truncate(str(working["last_error"])))
+    table.add_row("Notepad", "present" if history.get("notepad_exists") else "empty")
+    table.add_row("History summary", "present" if history.get("history_exists") else "empty")
+    table.add_row("Compression events", str(len(history.get("compression_events") or [])))
+
+    return table
+
+
 def _todos_table(todos: list[dict]) -> Table:
     table = Table(show_header=True, header_style="bold")
     table.add_column("Status")
@@ -74,7 +112,48 @@ def _print_event(event: dict) -> None:
             console.print(Panel(content or _json_block(data), title="📝 Final", border_style="magenta"))
             return
 
+        if node == "context_monitor":
+            token_count = int(data.get("context_token_count", 0))
+            should_compress = bool(data.get("context_should_compress"))
+            next_node = data.get("context_next_node", "")
+            status = "⚠️  compression needed" if should_compress else "✅ within budget"
+            console.print(
+                Panel(
+                    f"Tokens: {token_count:,}\nStatus: {status}\nNext: {next_node}",
+                    title="📈 Context Monitor",
+                    border_style="yellow" if should_compress else "blue",
+                )
+            )
+            return
+
+        if node == "context_compressor":
+            events = data.get("compression_events") or []
+            last_event = events[-1] if events else {}
+            before = int(last_event.get("token_count", 0))
+            after = int(data.get("context_token_count", 0))
+            summary = _truncate(str(last_event.get("summary", "")), 400)
+            console.print(
+                Panel(
+                    f"Tokens: {before:,} → {after:,}\nSummary: {summary or '—'}",
+                    title="🗜️  Context Compressor",
+                    border_style="magenta",
+                )
+            )
+            return
+
         console.print(Panel(_json_block(data), title=f"Node: {node}", border_style="white"))
+        return
+
+    if event_type == "memory_snapshot":
+        memory = event.get("memory") or {}
+        node = event.get("node", "")
+        console.print(
+            Panel(
+                _memory_table(memory),
+                title=f"🧠 Memory Snapshot: {node}",
+                border_style="grey50",
+            )
+        )
         return
 
     if event_type == "handoff":
