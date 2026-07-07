@@ -26,7 +26,7 @@ from Linki.graph.memory import (
 )
 from Linki.graph.state import AgentHandoff, LinkiGraphState, SourceItem, TodoItem, VerificationCheck, VerificationResult
 from Linki.providers.openai_provider import create_model
-from Linki.prompts.stage3 import PLANNER_PROMPT, VERIFIER_PROMPT
+from Linki.prompts.stage3 import CHAT_RESPONDER_PROMPT, INTENT_ROUTER_PROMPT, PLANNER_PROMPT, VERIFIER_PROMPT
 from Linki.prompts.stage4 import CONTEXT_COMPRESSION_PROMPT
 from Linki.tools.bash_tool import _decode_timeout_output, _validate_workspace_command
 from Linki.tools.registry import build_read_only_tools, build_tools
@@ -100,6 +100,90 @@ def _json_from_text(text: str) -> dict[str, Any]:
             return {}
 
     return value if isinstance(value, dict) else {}
+
+
+def _session_context_block(state: Mapping[str, Any]) -> str:
+    session_context = str(state.get("session_context") or "").strip()
+    if not session_context:
+        return "Session context: none"
+    return f"Session context:\n{session_context}"
+
+
+def _latest_user_input_block(state: Mapping[str, Any]) -> str:
+    return f"Latest user input:\n{state.get('task', '')}"
+
+
+def intent_router_node(state: LinkiGraphState) -> dict:
+    """Classify whether the latest input should be answered as chat or workflow."""
+
+    messages: list[BaseMessage] = [
+        SystemMessage(content=INTENT_ROUTER_PROMPT),
+        HumanMessage(
+            content="\n\n".join(
+                [
+                    _latest_user_input_block(_state_mapping(state)),
+                    _session_context_block(_state_mapping(state)),
+                ]
+            )
+        ),
+    ]
+
+    try:
+        response = _model(state).invoke(messages)
+        payload = _json_from_text(_message_content(response))
+    except Exception as exc:
+        return {
+            "intent_route": "workflow",
+            "intent_reason": f"intent router failed: {type(exc).__name__}: {exc}",
+            "intent_confidence": 0.0,
+            "context_next_node": "planner",
+        }
+
+    route = str(payload.get("route") or "").strip().lower()
+    reason = str(payload.get("reason") or "")
+    try:
+        confidence = float(payload.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+
+    if route not in {"chat", "workflow"} or confidence < 0.55:
+        if not reason:
+            reason = "Invalid or low-confidence intent classification."
+        route = "workflow"
+
+    return {
+        "intent_route": route,
+        "intent_reason": reason,
+        "intent_confidence": confidence,
+        "context_next_node": route,
+    }
+
+
+def chat_responder_node(state: LinkiGraphState) -> dict:
+    """Answer lightweight conversational turns without workspace tools."""
+
+    messages: list[BaseMessage] = [
+        SystemMessage(content=CHAT_RESPONDER_PROMPT),
+        HumanMessage(
+            content="\n\n".join(
+                [
+                    _latest_user_input_block(_state_mapping(state)),
+                    _session_context_block(_state_mapping(state)),
+                ]
+            )
+        ),
+    ]
+
+    response = _model(state).invoke(messages)
+    chat_response = _message_content(response).strip()
+    return {
+        "chat_response": chat_response,
+        "final_answer": chat_response,
+    }
+
+
+def intent_route_fn(state: LinkiGraphState) -> str:
+    return "chat_responder" if state.get("intent_route") == "chat" else "planner"
 
 
 def _todo_dict(value: Any, index: int) -> TodoItem:

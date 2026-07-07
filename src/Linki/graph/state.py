@@ -73,3 +73,10 @@ class LinkiGraphState(TypedDict, total=False):
     compression_events: list[CompressionEvent]
     memory_snapshot: LayeredMemory
     history_summary: str
+    intent_route: str
+    intent_reason: str
+    intent_confidence: float
+    chat_response: str
+    session_id: str
+    session_turn: int
+    session_context: str

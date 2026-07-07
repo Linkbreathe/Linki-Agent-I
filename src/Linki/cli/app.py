@@ -10,7 +10,8 @@ from rich.table import Table
 import typer
 
 from Linki.core.approval import ApprovalDecision, ApprovalRequest
-from Linki.core.agent import _parse_graph_event, stream_agent_events
+from Linki.core.agent import _parse_graph_event, stream_agent_events, stream_session_events
+from Linki.core.session import create_run_workspace
 
 app = typer.Typer(no_args_is_help=True)
 console = Console()
@@ -340,10 +341,45 @@ def _print_event(event: dict, *, verbose: bool = False) -> None:
             )
         return
 
+    if event_type == "session_saved":
+        if verbose:
+            console.print(
+                Panel(
+                    f"Session: {event.get('session_id')}\nTurn: {event.get('turn_index')}\nPath: {event.get('path')}",
+                    title="Session Saved",
+                    border_style="grey50",
+                )
+            )
+        return
+
+    if event_type == "intent_route":
+        console.print(
+            Panel(
+                f"Route: {event.get('route')}\nConfidence: {event.get('confidence')}\nReason: {event.get('reason')}",
+                title="🧭 Intent Route",
+                border_style="cyan",
+            )
+        )
+        return
+
     if event_type == "node_update":
         node = event.get("node")
         data = event.get("data", {})
         content = str(event.get("content", ""))
+
+        if node == "intent_router":
+            console.print(
+                Panel(
+                    f"Route: {data.get('intent_route')}\nConfidence: {data.get('intent_confidence')}\nReason: {data.get('intent_reason')}",
+                    title="🧭 Intent Router",
+                    border_style="cyan",
+                )
+            )
+            return
+
+        if node == "chat_responder":
+            console.print(Panel(content or _json_block(data), title="💬 Chat", border_style="green"))
+            return
 
         if node == "planner":
             renderables: list[Any] = [_todos_table(data["todos"])]
@@ -501,13 +537,17 @@ def _print_event(event: dict, *, verbose: bool = False) -> None:
 def main(
     task: Annotated[str | None, typer.Argument(help="Task to send to the Linki model.")] = None,
     workspace: Annotated[
-        Path,
+        Path | None,
         typer.Option(
             "--workspace",
             "-w",
-            help="Workspace directory. Created automatically when it does not exist.",
+            help=(
+                "Base directory for run folders. Each start creates a fresh "
+                "'run-<timestamp>' subfolder inside it so checkpoints are never "
+                "overwritten. Defaults to 'workspace'."
+            ),
         ),
-    ] = Path.cwd(),
+    ] = None,
     provider: Annotated[
         str,
         typer.Option(
@@ -566,6 +606,13 @@ def main(
             help="Print raw fallback events and checkpoint progress.",
         ),
     ] = False,
+    tui: Annotated[
+        bool,
+        typer.Option(
+            "--tui",
+            help="Launch the Textual terminal interface.",
+        ),
+    ] = False,
 ) -> None:
     provider_name = provider.lower()
     if provider_name not in {"openai", "deepseek"}:
@@ -576,26 +623,65 @@ def main(
         raise typer.BadParameter("checkpoint-mode must be 'light', 'strict', or 'off'")
     if trace_mode not in {"on", "off"}:
         raise typer.BadParameter("trace-mode must be 'on' or 'off'")
+
+    # Resuming targets an exact run folder; a fresh start gets a brand-new
+    # run-<timestamp> folder under the base directory so checkpoints from a
+    # previous run are never overwritten.
+    active_workspace = resume if resume is not None else create_run_workspace(workspace)
+
+    if tui:
+        from Linki.cli.tui.app import LinkiTuiApp
+
+        LinkiTuiApp(
+            workspace=active_workspace,
+            provider=provider_name,
+            model_name=model,
+            max_attempts=max_attempts,
+            approval_mode=approval_mode,
+            checkpoint_mode=checkpoint_mode,
+            trace_mode=trace_mode,
+            initial_task=task,
+        ).run()
+        return
+
     if task is None and resume is None:
         raise typer.BadParameter("task is required unless --resume is provided")
 
     approval_handler = _cli_approval_handler if approval_mode == "inline" else None
-    active_workspace = resume or workspace
+    if resume is None:
+        console.print(f"[dim]workspace → {active_workspace}[/dim]")
 
     try:
-        for event in stream_agent_events(
-            task or "",
-            workspace=active_workspace,
-            max_attempts=max_attempts,
-            approval_mode=approval_mode,
-            approval_handler=approval_handler,
-            checkpoint_mode=checkpoint_mode,
-            resume_workspace=resume,
-            trace_mode=trace_mode,
-            provider=provider_name,
-            model_name=model,
-        ):
+        event_stream = (
+            stream_agent_events(
+                task or "",
+                workspace=active_workspace,
+                max_attempts=max_attempts,
+                approval_mode=approval_mode,
+                approval_handler=approval_handler,
+                checkpoint_mode=checkpoint_mode,
+                resume_workspace=resume,
+                trace_mode=trace_mode,
+                provider=provider_name,
+                model_name=model,
+            )
+            if resume is not None
+            else stream_session_events(
+                task or "",
+                session_workspace=active_workspace,
+                max_attempts=max_attempts,
+                approval_mode=approval_mode,
+                approval_handler=approval_handler,
+                checkpoint_mode=checkpoint_mode,
+                trace_mode=trace_mode,
+                provider=provider_name,
+                model_name=model,
+            )
+        )
+        for event in event_stream:
             _print_event(event, verbose=verbose)
+    except KeyboardInterrupt as exc:
+        raise typer.Exit(code=130) from exc
     except ValueError as exc:
         typer.secho(str(exc), err=True, fg=typer.colors.RED)
         raise typer.Exit(code=1) from exc

@@ -44,6 +44,7 @@ class WorkingMemory(TypedDict):
     task: str
     session_id: str
     session_turn: int
+    session_context: str
     plan_summary: str
     todos: list[Any]
     acceptance_criteria: list[str]
@@ -119,6 +120,10 @@ def build_layered_memory(state: Mapping[str, Any], *, node: str = "graph") -> La
         "task": state.get("task", ""),
         "session_id": state.get("session_id", ""),
         "session_turn": state.get("session_turn", 0),
+        "session_context": _short_text(
+            state.get("session_context", ""),
+            7000,
+        ),
         "plan_summary": state.get("plan_summary", ""),
         "todos": state.get("todos", []),
         "acceptance_criteria": state.get("acceptance_criteria", []),

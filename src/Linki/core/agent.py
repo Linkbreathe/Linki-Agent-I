@@ -7,9 +7,17 @@ from langchain_core.messages import BaseMessage
 
 from Linki.core.checkpoint import CheckpointManager, resume_command
 from Linki.core.paths import ensure_workspace
+from Linki.core.session import (
+    append_assistant_turn,
+    append_user_turn,
+    build_session_context,
+    load_or_create_session,
+    resolve_session_workspace,
+    save_session,
+)
 from Linki.core.state import create_runtime
 from Linki.core.trace import TraceRecorder
-from Linki.graph.workflow import build_complex_workflow
+from Linki.graph.workflow import build_complex_workflow, build_entry_workflow
 from Linki.providers.openai_provider import create_model
 
 
@@ -51,6 +59,15 @@ def _json_safe(value: Any) -> Any:
 
 
 def _content_for_node(node: str, update: Mapping[str, Any]) -> str:
+    if node == "intent_router":
+        route = str(update.get("intent_route", "workflow"))
+        confidence = update.get("intent_confidence", 0.0)
+        reason = str(update.get("intent_reason", ""))
+        return f"Route: {route} (confidence={confidence}). {reason}".strip()
+
+    if node == "chat_responder":
+        return str(update.get("chat_response") or update.get("final_answer") or "")
+
     if node == "planner":
         parts = [str(update.get("plan_summary", ""))]
         code_agent_summary = update.get("code_agent_summary")
@@ -191,6 +208,9 @@ def stream_agent_events(
     provider: str = "openai",
     model_name: str | None = None,
     model: Any | None = None,
+    session_id: str = "",
+    session_turn: int = 0,
+    session_context: str = "",
 ) -> Iterator[dict]:
     """Stream graph/custom events while recording checkpoints and traces."""
 
@@ -215,6 +235,9 @@ def stream_agent_events(
         "max_attempts": max_attempts,
         "provider": provider,
         "model_name": model_name,
+        "session_id": session_id,
+        "session_turn": session_turn,
+        "session_context": session_context,
     }
     latest_node: str | None = "start"
     trace_started = False
@@ -233,6 +256,9 @@ def stream_agent_events(
             inputs["provider"] = provider
             inputs["model_name"] = model_name
             inputs["model"] = model or create_model(provider=provider, model=model_name)
+            inputs["session_id"] = session_id
+            inputs["session_turn"] = session_turn
+            inputs["session_context"] = session_context
         else:
             inputs = {
                 "task": task,
@@ -242,6 +268,9 @@ def stream_agent_events(
                 "provider": provider,
                 "model_name": model_name,
                 "model": model or create_model(provider=provider, model=model_name),
+                "session_id": session_id,
+                "session_turn": session_turn,
+                "session_context": session_context,
             }
 
         current_state = dict(inputs)
@@ -381,4 +410,176 @@ def stream_agent_events(
             latest_node=latest_node,
             final_state=current_state,
         )
+        raise
+
+
+def stream_session_events(
+    task: str,
+    *,
+    session_workspace: str | Path | None = None,
+    max_attempts: int = 3,
+    approval_mode: str = "inline",
+    approval_handler: Callable[[Any], Any] | None = None,
+    checkpoint_mode: str = "light",
+    trace_mode: str = "on",
+    **kwargs: Any,
+) -> Iterator[dict]:
+    """
+    Stream events for a multi-turn conversation session.
+
+    The session entry graph routes each turn to either lightweight chat or the
+    full task workflow. The user's turn is saved before model work starts so
+    interruptions do not lose the latest input.
+    """
+
+    workspace_arg = session_workspace if session_workspace is not None else kwargs.pop("workspace", None)
+    workspace = resolve_session_workspace(workspace_arg)
+    provider = str(kwargs.pop("provider", "openai"))
+    model_name = kwargs.pop("model_name", None)
+    model = kwargs.pop("model", None)
+
+    runtime = create_runtime(
+        workspace,
+        approval_mode=approval_mode,
+        approval_handler=approval_handler,
+        checkpoint_mode=checkpoint_mode,
+        trace_mode=trace_mode,
+    )
+    ensure_workspace(runtime, create=True)
+
+    session = load_or_create_session(workspace)
+    turn = append_user_turn(session, task)
+    saved_event = save_session(workspace, session)
+    yield saved_event
+
+    session_context = build_session_context(workspace, session)
+    entry_model = model or create_model(provider=provider, model=model_name)
+    entry_inputs: dict[str, Any] = {
+        "task": task,
+        "runtime": runtime,
+        "session_id": session["session_id"],
+        "session_turn": turn,
+        "session_context": session_context,
+        "provider": provider,
+        "model_name": model_name,
+        "model": entry_model,
+    }
+
+    route = "workflow"
+    intent_reason = ""
+    intent_confidence = 0.0
+    assistant_recorded = False
+
+    try:
+        entry_state = dict(entry_inputs)
+        entry_workflow = build_entry_workflow()
+
+        for raw_event in entry_workflow.stream(entry_inputs, stream_mode=["updates", "custom"]):
+            if isinstance(raw_event, tuple) and len(raw_event) == 2:
+                mode, event = raw_event
+            else:
+                mode, event = "updates", raw_event
+
+            if mode == "custom":
+                custom_event = _ensure_event_mapping(event)
+                yield {
+                    "type": "custom_event",
+                    "event": custom_event,
+                }
+                continue
+
+            graph_event = _ensure_event_mapping(event)
+            entry_state = _merge_graph_update(entry_state, graph_event)
+            yield {
+                "type": "graph_event",
+                "event": graph_event,
+            }
+
+        route = str(entry_state.get("intent_route") or "workflow")
+        if route not in {"chat", "workflow"}:
+            route = "workflow"
+        intent_reason = str(entry_state.get("intent_reason") or "")
+        try:
+            intent_confidence = float(entry_state.get("intent_confidence") or 0.0)
+        except (TypeError, ValueError):
+            intent_confidence = 0.0
+
+        yield {
+            "type": "intent_route",
+            "route": route,
+            "reason": intent_reason,
+            "confidence": intent_confidence,
+            "session_id": session["session_id"],
+            "turn": turn,
+        }
+
+        if route == "chat":
+            chat_response = str(entry_state.get("chat_response") or entry_state.get("final_answer") or "")
+            append_assistant_turn(
+                session,
+                turn=turn,
+                route="chat",
+                content=chat_response,
+                summary=chat_response,
+            )
+            assistant_recorded = True
+            yield save_session(workspace, session)
+            yield {
+                "type": "final_answer",
+                "route": "chat",
+                "content": chat_response,
+                "session_id": session["session_id"],
+                "turn": turn,
+            }
+            return
+
+        final_answer = ""
+        for event in stream_agent_events(
+            task,
+            workspace=workspace,
+            max_attempts=max_attempts,
+            approval_mode=approval_mode,
+            approval_handler=approval_handler,
+            checkpoint_mode=checkpoint_mode,
+            trace_mode=trace_mode,
+            provider=provider,
+            model_name=model_name,
+            model=entry_model,
+            session_id=session["session_id"],
+            session_turn=turn,
+            session_context=session_context,
+        ):
+            if event.get("type") == "graph_event":
+                inner = event.get("event")
+                if isinstance(inner, Mapping):
+                    final_update = inner.get("final")
+                    if isinstance(final_update, Mapping):
+                        final_answer = str(final_update.get("final_answer") or final_answer)
+            yield event
+
+        if not final_answer:
+            final_answer = "Workflow completed."
+
+        append_assistant_turn(
+            session,
+            turn=turn,
+            route="workflow",
+            content=final_answer,
+            summary=final_answer,
+        )
+        assistant_recorded = True
+        yield save_session(workspace, session)
+        yield {
+            "type": "final_answer",
+            "route": "workflow",
+            "content": final_answer,
+            "session_id": session["session_id"],
+            "turn": turn,
+        }
+    except KeyboardInterrupt:
+        save_session(workspace, session)
+        raise
+    except Exception:
+        if not assistant_recorded:
+            save_session(workspace, session)
         raise
