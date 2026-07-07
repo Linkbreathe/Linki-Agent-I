@@ -27,6 +27,20 @@ class VerificationCheck(TypedDict):
     detail: str
 
 
+class SourceItem(TypedDict, total=False):
+    title: str
+    url: str
+    content: str
+    score: float
+
+
+class AgentHandoff(TypedDict, total=False):
+    from_agent: str
+    to_agent: str
+    instruction: str
+    result: str
+
+
 class LinkiGraphState(TypedDict, total=False):
     task: str
     runtime: RuntimeState
@@ -40,6 +54,10 @@ class LinkiGraphState(TypedDict, total=False):
     verification_commands: list[str]
     verification_results: list[VerificationResult]
     verification_checks: list[VerificationCheck]
+    research_notes: str
+    sources: list[SourceItem]
+    agent_handoffs: list[AgentHandoff]
+    code_agent_summary: str
     passed: bool
     attempts: int
     max_attempts: int

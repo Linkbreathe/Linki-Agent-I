@@ -63,10 +63,6 @@ def _print_event(event: dict) -> None:
             )
             return
 
-        if node == "actor":
-            console.print(Panel(content or _json_block(data), title="🔧 Actor", border_style="cyan"))
-            return
-
         if node == "verifier":
             passed = bool(data["passed"])
             title = "✅ Verifier" if passed else "❌ Verifier"
@@ -79,6 +75,26 @@ def _print_event(event: dict) -> None:
             return
 
         console.print(Panel(_json_block(data), title=f"Node: {node}", border_style="white"))
+        return
+
+    if event_type == "handoff":
+        console.print(
+            Panel(
+                str(event.get("instruction", "")),
+                title=f"🤝 Handoff: {event.get('from')} → {event.get('to')}",
+                border_style="yellow",
+            )
+        )
+        return
+
+    if event_type == "search_results":
+        console.print(
+            Panel(
+                _json_block(event.get("result", {})),
+                title=f"🔎 Search: {event.get('query')}",
+                border_style="cyan",
+            )
+        )
         return
 
     if event_type == "tool_call":
@@ -138,7 +154,7 @@ def main(
         int,
         typer.Option(
             "--max-attempts",
-            help="Maximum planner/actor/verifier attempts to run.",
+            help="Maximum planner/verifier attempts to run.",
         ),
     ] = 3,
 ) -> None:

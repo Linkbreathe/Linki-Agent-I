@@ -50,10 +50,11 @@ def _json_safe(value: Any) -> Any:
 
 def _content_for_node(node: str, update: Mapping[str, Any]) -> str:
     if node == "planner":
-        return str(update.get("plan_summary", ""))
-
-    if node == "actor":
-        return str(update.get("last_actor_summary", ""))
+        parts = [str(update.get("plan_summary", ""))]
+        code_agent_summary = update.get("code_agent_summary")
+        if code_agent_summary:
+            parts.append(str(code_agent_summary))
+        return "\n".join(part for part in parts if part)
 
     if node == "verifier":
         passed = bool(update.get("passed"))

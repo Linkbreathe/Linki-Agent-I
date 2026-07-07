@@ -9,11 +9,13 @@ from langchain_core.tools import StructuredTool
 from langgraph.config import get_stream_writer
 from pydantic import BaseModel, Field
 
+from Linki.agents.code_agent import run_code_agent
+from Linki.agents.search_agent import run_search_agent
 from Linki.core.paths import ensure_workspace
 from Linki.core.state import RuntimeState
-from Linki.graph.state import LinkiGraphState, TodoItem, VerificationCheck, VerificationResult
+from Linki.graph.state import AgentHandoff, LinkiGraphState, SourceItem, TodoItem, VerificationCheck, VerificationResult
 from Linki.providers.openai_provider import create_model
-from Linki.prompts.stage2 import ACTOR_PROMPT, PLANNER_PROMPT, VERIFIER_PROMPT
+from Linki.prompts.stage3 import PLANNER_PROMPT, VERIFIER_PROMPT
 from Linki.tools.bash_tool import _decode_timeout_output, _validate_workspace_command
 from Linki.tools.registry import build_read_only_tools, build_tools
 
@@ -26,23 +28,6 @@ class TodoItemSchema(BaseModel):
     content: str = Field(description="Concrete work item.")
     status: str = Field(description="pending, in_progress, completed, or blocked.")
     note: str = Field(default="", description="Short context or blocker note.")
-
-
-class TodoWriteTool(BaseModel):
-    """Write the complete plan for the current task."""
-
-    plan_summary: str
-    todos: list[TodoItemSchema]
-    acceptance_criteria: list[str]
-    verification_commands: list[str]
-
-
-class TodoUpdateTool(BaseModel):
-    """Update the status and note for one todo item."""
-
-    id: str
-    status: str = Field(description="pending, in_progress, completed, or blocked.")
-    note: str = ""
 
 
 def _state_mapping(state: LinkiGraphState) -> Mapping[str, Any]:
@@ -76,7 +61,7 @@ def _message_content(message: Any) -> str:
 def _emit_custom_event(event: Mapping[str, Any]) -> None:
     try:
         writer = get_stream_writer()
-    except RuntimeError:
+    except (RuntimeError, KeyError):
         return
     writer(dict(event))
 
@@ -102,16 +87,6 @@ def _json_from_text(text: str) -> dict[str, Any]:
             return {}
 
     return value if isinstance(value, dict) else {}
-
-
-def _structured_payload(message: Any, preferred_tool: str | None = None) -> dict[str, Any]:
-    tool_calls = getattr(message, "tool_calls", None) or []
-    for call in tool_calls:
-        if preferred_tool is None or call.get("name") == preferred_tool:
-            args = call.get("args", {})
-            return args if isinstance(args, dict) else {}
-
-    return _json_from_text(_message_content(message))
 
 
 def _todo_dict(value: Any, index: int) -> TodoItem:
@@ -162,46 +137,6 @@ def _plan_context(state: LinkiGraphState) -> str:
     )
 
 
-def planner_node(state: LinkiGraphState) -> dict:
-    """Create or revise the graph plan."""
-
-    has_todos = bool(state.get("todos"))
-    failed_previous_verification = state.get("passed") is False or bool(state.get("last_error"))
-    if has_todos and not failed_previous_verification:
-        return {
-            "plan_summary": state.get("plan_summary", ""),
-            "todos": state.get("todos", []),
-            "acceptance_criteria": state.get("acceptance_criteria", []),
-            "verification_commands": state.get("verification_commands", []),
-        }
-
-    if has_todos:
-        user_prompt = "\n".join(
-            [
-                "Revise the existing plan based on the verifier failure.",
-                f"Task:\n{state.get('task', '')}",
-                f"Last error:\n{state.get('last_error', '')}",
-                f"Current plan:\n{_plan_context(state)}",
-            ]
-        )
-    else:
-        user_prompt = "\n".join(
-            [
-                "Create an implementation plan for this task.",
-                f"Task:\n{state.get('task', '')}",
-            ]
-        )
-
-    agent = _model(state).bind_tools([TodoWriteTool])
-    response = agent.invoke(
-        [
-            SystemMessage(content=PLANNER_PROMPT),
-            HumanMessage(content=user_prompt),
-        ]
-    )
-    return _normalize_plan(_structured_payload(response, "TodoWriteTool"))
-
-
 def _tool_result(name: str, ok: bool, output: Any = None, error: BaseException | None = None) -> dict:
     result = {"ok": ok, "name": name}
     if error is not None:
@@ -212,38 +147,9 @@ def _tool_result(name: str, ok: bool, output: Any = None, error: BaseException |
     return result
 
 
-def _update_todo(todos: list[TodoItem], todo_id: str, status: str, note: str) -> dict:
-    if status not in TODO_STATUSES:
-        raise ValueError(f"Unsupported todo status: {status}")
-
-    for todo in todos:
-        if todo["id"] == todo_id:
-            todo["status"] = status
-            todo["note"] = note
-            return {"updated": todo}
-
-    raise ValueError(f"Unknown todo id: {todo_id}")
-
-
-def _execute_call(
-    call: dict,
-    tools_by_name: Mapping[str, StructuredTool],
-    todos: list[TodoItem] | None = None,
-) -> dict:
+def _execute_call(call: dict, tools_by_name: Mapping[str, StructuredTool]) -> dict:
     name = call["name"]
     args = call.get("args", {})
-
-    if name == "TodoUpdateTool" and todos is not None:
-        try:
-            output = _update_todo(
-                todos,
-                todo_id=str(args.get("id", "")),
-                status=str(args.get("status", "")),
-                note=str(args.get("note", "")),
-            )
-        except Exception as exc:
-            return _tool_result(name, False, error=exc)
-        return _tool_result(name, True, output=output)
 
     tool = tools_by_name.get(name)
     if tool is None:
@@ -261,7 +167,6 @@ def _react_events(
     tools_by_name: Mapping[str, StructuredTool],
     *,
     node: str,
-    todos: list[TodoItem] | None = None,
     max_loops: int = 10,
 ) -> Iterator[dict[str, Any]]:
     for _ in range(max_loops):
@@ -279,7 +184,7 @@ def _react_events(
             event = {"type": "tool_call", "node": node, "name": call["name"], "args": call.get("args", {})}
             _emit_custom_event(event)
             yield event
-            result = _execute_call(call, tools_by_name, todos)
+            result = _execute_call(call, tools_by_name)
             tool_message = ToolMessage(
                 content=json.dumps(result, ensure_ascii=False),
                 tool_call_id=call["id"],
@@ -295,34 +200,212 @@ def _react_events(
             yield {**event, "message": tool_message}
 
 
-def actor_node(state: LinkiGraphState) -> dict:
-    """Run the actor ReAct loop against the current plan."""
+def _append_research_notes(existing: str, addition: str) -> str:
+    addition = addition.strip()
+    if not addition:
+        return existing
+    if not existing:
+        return addition
+    return f"{existing}\n\n{addition}"
 
-    runtime = _runtime(state)
-    tools = build_tools(runtime)
-    tools_by_name = {tool.name: tool for tool in tools}
-    todos = [_todo_dict(todo, index) for index, todo in enumerate(state.get("todos", []))]
 
-    agent = _model(state).bind_tools(tools + [TodoUpdateTool])
-    actor_input = "\n".join(
-        [
-            f"Current plan:\n{_plan_context(state)}",
-            f"Task:\n{state.get('task', '')}",
-        ]
+def _merge_sources(existing: list[SourceItem], new_sources: list[Any]) -> list[SourceItem]:
+    merged: dict[str, SourceItem] = {}
+    for item in list(existing) + list(new_sources or []):
+        if not isinstance(item, Mapping):
+            continue
+        url = str(item.get("url") or "")
+        if not url:
+            continue
+        merged[url] = {
+            "title": str(item.get("title") or ""),
+            "url": url,
+            "content": str(item.get("content") or ""),
+            "score": float(item.get("score") or 0.0),
+        }
+    return list(merged.values())
+
+
+def _call_search_agent_tool(state: dict[str, Any], writer: Any, instruction: str) -> dict:
+    writer(
+        {
+            "type": "handoff",
+            "from": "planner",
+            "to": "searchAgent",
+            "instruction": instruction,
+        }
     )
-    messages: list[BaseMessage] = [
-        SystemMessage(content=ACTOR_PROMPT),
-        HumanMessage(content=actor_input),
+
+    result = run_search_agent(
+        state,
+        instruction,
+        writer=writer,
+    )
+
+    state["research_notes"] = _append_research_notes(state.get("research_notes", ""), str(result.get("summary", "")))
+    state["sources"] = _merge_sources(state.get("sources", []), result.get("sources", []))
+    state.setdefault("agent_handoffs", []).append(
+        {
+            "from_agent": "planner",
+            "to_agent": "searchAgent",
+            "instruction": instruction,
+            "result": str(result.get("summary", "")),
+        }
+    )
+
+    return result
+
+
+def _call_code_agent_tool(state: dict[str, Any], writer: Any, instruction: str) -> dict:
+    writer(
+        {
+            "type": "handoff",
+            "from": "planner",
+            "to": "codeAgent",
+            "instruction": instruction,
+        }
+    )
+
+    result = run_code_agent(
+        state,
+        instruction,
+        writer=writer,
+    )
+
+    state["todos"] = result.get("todos", state.get("todos", []))
+    state["code_agent_summary"] = str(result.get("summary", ""))
+    state.setdefault("agent_handoffs", []).append(
+        {
+            "from_agent": "planner",
+            "to_agent": "codeAgent",
+            "instruction": instruction,
+            "result": str(result.get("summary", "")),
+        }
+    )
+    state["messages"] = result.get("messages", state.get("messages", []))
+
+    return result
+
+
+def _build_planner_tools(working: dict[str, Any]) -> list[StructuredTool]:
+    def todo_write_tool(
+        plan_summary: str,
+        todos: list[TodoItemSchema],
+        acceptance_criteria: list[str],
+        verification_commands: list[str],
+    ) -> dict[str, Any]:
+        plan = _normalize_plan(
+            {
+                "plan_summary": plan_summary,
+                "todos": todos,
+                "acceptance_criteria": acceptance_criteria,
+                "verification_commands": verification_commands,
+            }
+        )
+        working.update(plan)
+        return {"ok": True, "plan": plan}
+
+    def call_search_agent_tool(instruction: str) -> dict[str, Any]:
+        result = _call_search_agent_tool(working, _emit_custom_event, instruction)
+        return {
+            "ok": bool(result.get("ok", True)),
+            "summary": result.get("summary", ""),
+            "queries": result.get("queries", []),
+            "sources": result.get("sources", []),
+        }
+
+    def call_code_agent_tool(instruction: str) -> dict[str, Any]:
+        result = _call_code_agent_tool(working, _emit_custom_event, instruction)
+        return {
+            "ok": bool(result.get("ok", True)),
+            "summary": result.get("summary", ""),
+            "todos": result.get("todos", []),
+        }
+
+    return [
+        StructuredTool.from_function(
+            func=todo_write_tool,
+            name="TodoWriteTool",
+            description="Publish or revise the plan, todos, acceptance criteria, and verification commands.",
+        ),
+        StructuredTool.from_function(
+            func=call_search_agent_tool,
+            name="CallSearchAgentTool",
+            description="Delegate a research task to searchAgent.",
+        ),
+        StructuredTool.from_function(
+            func=call_code_agent_tool,
+            name="CallCodeAgentTool",
+            description="Delegate an implementation task to codeAgent.",
+        ),
     ]
 
-    last_actor_summary = ""
-    for event in _react_events(agent, messages, tools_by_name, node="actor", todos=todos, max_loops=10):
+
+def planner_node(state: LinkiGraphState) -> dict:
+    """Run the planner/supervisor node: publish the plan and delegate to searchAgent/codeAgent."""
+
+    runtime = _runtime(state)
+    failed_previous_verification = state.get("passed") is False or bool(state.get("last_error"))
+
+    working: dict[str, Any] = {
+        "task": state.get("task", ""),
+        "runtime": runtime,
+        "provider": state.get("provider", "openai"),
+        "model_name": state.get("model_name"),
+        "model": state.get("model"),
+        "todos": [_todo_dict(todo, index) for index, todo in enumerate(state.get("todos", []))],
+        "plan_summary": state.get("plan_summary", ""),
+        "acceptance_criteria": list(state.get("acceptance_criteria", [])),
+        "verification_commands": list(state.get("verification_commands", [])),
+        "research_notes": state.get("research_notes", ""),
+        "sources": list(state.get("sources", [])),
+        "agent_handoffs": list(state.get("agent_handoffs", [])),
+        "code_agent_summary": state.get("code_agent_summary", ""),
+        "messages": list(state.get("messages", [])),
+    }
+
+    if failed_previous_verification:
+        supervisor_prompt = "\n".join(
+            [
+                "Revise the existing plan based on the verifier failure, then delegate only the missing fix.",
+                f"Task:\n{working['task']}",
+                f"Last error:\n{state.get('last_error', '')}",
+                f"Current plan:\n{_plan_context(state)}",
+            ]
+        )
+    else:
+        supervisor_prompt = "\n".join(
+            [
+                "Plan this task and delegate the needed work to the specialist agents.",
+                f"Task:\n{working['task']}",
+            ]
+        )
+
+    tools = _build_planner_tools(working)
+    tools_by_name = {tool.name: tool for tool in tools}
+    agent = _model(state).bind_tools(tools)
+
+    messages: list[BaseMessage] = [
+        SystemMessage(content=PLANNER_PROMPT),
+        HumanMessage(content=supervisor_prompt),
+    ]
+
+    supervisor_summary = ""
+    for event in _react_events(agent, messages, tools_by_name, node="planner", max_loops=10):
         if event["type"] == "ai_message":
-            last_actor_summary = str(event["content"])
+            supervisor_summary = str(event["content"])
 
     return {
-        "messages": messages,
-        "last_actor_summary": last_actor_summary,
+        "plan_summary": working["plan_summary"],
+        "todos": working["todos"],
+        "acceptance_criteria": working["acceptance_criteria"],
+        "verification_commands": working["verification_commands"],
+        "research_notes": working["research_notes"],
+        "sources": working["sources"],
+        "agent_handoffs": working["agent_handoffs"],
+        "code_agent_summary": working["code_agent_summary"],
+        "messages": working["messages"],
+        "last_actor_summary": working["code_agent_summary"] or supervisor_summary,
     }
 
 
