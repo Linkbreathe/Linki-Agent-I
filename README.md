@@ -14,6 +14,7 @@ Set provider API keys in a `.env` file or in the environment before running mode
 ```bash
 Linki "Summarize this workspace" --provider openai --workspace ./workspace
 Linki "Summarize this workspace" --provider deepseek --workspace ./workspace
+Linki "Create a Tetris game as a single HTML file" --provider deepseek --workspace ./workspace --max-loops 10
 ```
 
 Provider defaults:
