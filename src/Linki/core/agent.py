@@ -7,6 +7,7 @@ from langchain_core.messages import BaseMessage
 
 from Linki.core.checkpoint import CheckpointManager, resume_command
 from Linki.core.context import assemble_project_context
+from Linki.core.hooks import load_hooks_config
 from Linki.core.paths import ensure_workspace
 from Linki.core.session import (
     append_assistant_turn,
@@ -225,6 +226,7 @@ def stream_agent_events(
         trace_mode=trace_mode,
     )
     ensure_workspace(runtime, create=True)
+    load_hooks_config(runtime)
 
     # Assemble the workspace's project context once per run; planner/codeAgent
     # prompt builders inject it from graph state.

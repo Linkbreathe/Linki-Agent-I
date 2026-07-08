@@ -15,6 +15,7 @@ class RuntimeState:
     trace_mode: str | None = None
     trace_id: str | None = None
     resume_from: Path | None = None
+    event_handler: Callable[[dict[str, Any]], None] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "workspace", Path(self.workspace).expanduser().resolve())
@@ -31,6 +32,7 @@ def create_runtime(
     resume_from: str | Path | None = None,
     trace_mode: str = "on",
     trace_id: str | None = None,
+    event_handler: Callable[[dict[str, Any]], None] | None = None,
 ) -> RuntimeState:
     """Create the normalized runtime object shared by graph nodes and tools."""
 
@@ -42,4 +44,5 @@ def create_runtime(
         trace_mode=trace_mode,
         trace_id=trace_id,
         resume_from=Path(resume_from) if resume_from is not None else None,
+        event_handler=event_handler,
     )

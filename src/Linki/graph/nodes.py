@@ -36,6 +36,7 @@ from Linki.prompts.stage3 import (
 from Linki.prompts.stage4 import CONTEXT_COMPRESSION_PROMPT
 from Linki.tools.ask_user_tool import DEFAULT_ASK_BUDGET, make_ask_user_question_tool
 from Linki.tools.bash_tool import _decode_timeout_output, _validate_workspace_command
+from Linki.tools.executor import is_tool_result
 from Linki.tools.plan_tools import make_enter_plan_mode_tool, make_exit_plan_mode_tool
 from Linki.tools.registry import build_read_only_tools, build_tools
 
@@ -261,7 +262,10 @@ def _execute_call(call: dict, tools_by_name: Mapping[str, StructuredTool]) -> di
         return _tool_result(name, False, error=ValueError(f"Unknown tool: {name}"))
 
     try:
-        return _tool_result(name, True, output=tool.invoke(args))
+        output = tool.invoke(args)
+        if is_tool_result(output, name):
+            return output
+        return _tool_result(name, True, output=output)
     except Exception as exc:
         return _tool_result(name, False, error=exc)
 

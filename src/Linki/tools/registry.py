@@ -1,9 +1,8 @@
-import json
-
 from langchain_core.tools import StructuredTool
 
 from Linki.core.state import RuntimeState
 from Linki.tools.bash_tool import BashTool
+from Linki.tools.executor import execute_tool
 from Linki.tools.file_tools import FileEditTool, FileReadTool, FileWriteTool
 from Linki.tools.grep_tool import GrepTool
 
@@ -32,14 +31,29 @@ def build_tools(
     grep = GrepTool(state)
     bash = BashTool(state)
 
-    def file_read_tool(file_path: str, offset: int = 0, limit: int | None = None) -> str:
-        return file_read(file_path=file_path, offset=offset, limit=limit)
+    def file_read_tool(file_path: str, offset: int = 0, limit: int | None = None) -> dict:
+        return execute_tool(
+            state,
+            "FileReadTool",
+            {"file_path": file_path, "offset": offset, "limit": limit},
+            file_read,
+        )
 
-    def file_write_tool(file_path: str, content: str) -> str:
-        return file_write(file_path=file_path, content=content)
+    def file_write_tool(file_path: str, content: str) -> dict:
+        return execute_tool(
+            state,
+            "FileWriteTool",
+            {"file_path": file_path, "content": content},
+            file_write,
+        )
 
-    def file_edit_tool(file_path: str, old_text: str, new_text: str) -> str:
-        return file_edit(file_path=file_path, old_text=old_text, new_text=new_text)
+    def file_edit_tool(file_path: str, old_text: str, new_text: str) -> dict:
+        return execute_tool(
+            state,
+            "FileEditTool",
+            {"file_path": file_path, "old_text": old_text, "new_text": new_text},
+            file_edit,
+        )
 
     def grep_tool(
         pattern: str,
@@ -47,17 +61,27 @@ def build_tools(
         glob: str | None = None,
         head_limit: int = 50,
         ignore_case: bool = False,
-    ) -> str:
-        return grep(
-            pattern=pattern,
-            path=path,
-            glob=glob,
-            head_limit=head_limit,
-            ignore_case=ignore_case,
+    ) -> dict:
+        return execute_tool(
+            state,
+            "GrepTool",
+            {
+                "pattern": pattern,
+                "path": path,
+                "glob": glob,
+                "head_limit": head_limit,
+                "ignore_case": ignore_case,
+            },
+            grep,
         )
 
-    def bash_tool(command: str, timeout_seconds: int = 30) -> str:
-        return json.dumps(bash(command=command, timeout_seconds=timeout_seconds), ensure_ascii=False)
+    def bash_tool(command: str, timeout_seconds: int = 30) -> dict:
+        return execute_tool(
+            state,
+            "BashTool",
+            {"command": command, "timeout_seconds": timeout_seconds},
+            bash,
+        )
 
     tools = [
         StructuredTool.from_function(
@@ -99,8 +123,13 @@ def build_read_only_tools(state: RuntimeState) -> list[StructuredTool]:
     file_read = FileReadTool(state)
     grep = GrepTool(state)
 
-    def file_read_tool(file_path: str, offset: int = 0, limit: int | None = None) -> str:
-        return file_read(file_path=file_path, offset=offset, limit=limit)
+    def file_read_tool(file_path: str, offset: int = 0, limit: int | None = None) -> dict:
+        return execute_tool(
+            state,
+            "FileReadTool",
+            {"file_path": file_path, "offset": offset, "limit": limit},
+            file_read,
+        )
 
     def grep_tool(
         pattern: str,
@@ -108,13 +137,18 @@ def build_read_only_tools(state: RuntimeState) -> list[StructuredTool]:
         glob: str | None = None,
         head_limit: int = 50,
         ignore_case: bool = False,
-    ) -> str:
-        return grep(
-            pattern=pattern,
-            path=path,
-            glob=glob,
-            head_limit=head_limit,
-            ignore_case=ignore_case,
+    ) -> dict:
+        return execute_tool(
+            state,
+            "GrepTool",
+            {
+                "pattern": pattern,
+                "path": path,
+                "glob": glob,
+                "head_limit": head_limit,
+                "ignore_case": ignore_case,
+            },
+            grep,
         )
 
     return [

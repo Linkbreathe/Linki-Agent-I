@@ -3,9 +3,27 @@ from pathlib import Path
 from Linki.core.paths import resolve_workspace_path
 from Linki.core.state import RuntimeState
 
+PROTECTED_PATHS = (".linki/hooks.json", ".linki/hooks/")
+PROTECTED_PATH_ERROR = "protected path: 策略文件对 Agent 只读"
+
 
 def _display_path(state: RuntimeState, path: Path) -> str:
     return str(path.relative_to(state.workspace))
+
+
+def protected_path_error(state: RuntimeState, file_path: str) -> str | None:
+    """Return the kernel-level policy error for protected hook policy paths."""
+
+    path = resolve_workspace_path(state, file_path)
+    relative = path.relative_to(state.workspace).as_posix()
+    for protected in PROTECTED_PATHS:
+        if protected.endswith("/"):
+            directory = protected.rstrip("/")
+            if relative == directory or relative.startswith(protected):
+                return PROTECTED_PATH_ERROR
+        elif relative == protected:
+            return PROTECTED_PATH_ERROR
+    return None
 
 
 class FileReadTool:
@@ -32,6 +50,10 @@ class FileWriteTool:
         self.state = state
 
     def __call__(self, file_path: str, content: str) -> str:
+        error = protected_path_error(self.state, file_path)
+        if error:
+            return error
+
         path = resolve_workspace_path(self.state, file_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
@@ -43,6 +65,10 @@ class FileEditTool:
         self.state = state
 
     def __call__(self, file_path: str, old_text: str, new_text: str) -> str:
+        error = protected_path_error(self.state, file_path)
+        if error:
+            return error
+
         if old_text == "":
             raise ValueError("old_text must not be empty")
 

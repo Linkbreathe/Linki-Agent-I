@@ -6,6 +6,7 @@ from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, To
 from langchain_core.tools import StructuredTool
 
 from Linki.providers.openai_provider import create_model
+from Linki.tools.executor import execute_tool, is_tool_result
 from Linki.tools.web_search_tool import WebSearchTool
 
 SEARCH_AGENT_PROMPT = """You are searchAgent, a focused research specialist.
@@ -59,15 +60,31 @@ def _build_human_message(state: Any, instruction: str) -> str:
     return "\n\n".join(parts)
 
 
-def _build_web_search_tool(web_search: WebSearchTool) -> StructuredTool:
-    def web_search_tool(query: str) -> str:
-        return json.dumps(web_search(query), ensure_ascii=False)
+def _runtime(state: Any) -> Any:
+    values = state if isinstance(state, Mapping) else {}
+    return values.get("runtime")
+
+
+def _build_web_search_tool(state: Any, web_search: WebSearchTool) -> StructuredTool:
+    runtime = _runtime(state)
+
+    def web_search_tool(query: str) -> dict:
+        if runtime is None:
+            return {"ok": True, "name": "WebSearchTool", "output": web_search(query)}
+        return execute_tool(runtime, "WebSearchTool", {"query": query}, web_search)
 
     return StructuredTool.from_function(
         func=web_search_tool,
         name="WebSearchTool",
         description="Search the web for factual information and return sources.",
     )
+
+
+def _effective_tool_output(result: Any, tool_name: str) -> dict[str, Any]:
+    if is_tool_result(result, tool_name):
+        output = result.get("output")
+        return dict(output) if isinstance(output, Mapping) else {"ok": result.get("ok"), "output": output}
+    return dict(result) if isinstance(result, Mapping) else {"ok": False, "error": str(result)}
 
 
 def run_search_agent(
@@ -85,7 +102,7 @@ def run_search_agent(
     """
 
     web_search = WebSearchTool()
-    tool = _build_web_search_tool(web_search)
+    tool = _build_web_search_tool(state, web_search)
     agent = _model(state).bind_tools([tool])
 
     messages: list[BaseMessage] = [
@@ -116,9 +133,10 @@ def run_search_agent(
             if writer is not None:
                 writer(dict(tool_call_event))
 
-            result = web_search(query)
-            if result.get("ok"):
-                for item in result.get("results", []):
+            result = tool.invoke(call.get("args", {}))
+            effective_result = _effective_tool_output(result, call["name"])
+            if effective_result.get("ok"):
+                for item in effective_result.get("results", []):
                     url = item.get("url", "")
                     if url:
                         sources.setdefault(url, item)

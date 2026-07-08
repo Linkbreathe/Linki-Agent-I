@@ -1,0 +1,18 @@
+{
+  "PreToolUse": [
+    {
+      "matcher": "File(Read|Write|Edit)Tool",
+      "command": "python .linki/hooks/protect_secrets.py"
+    },
+    {
+      "matcher": "BashTool",
+      "command": "python .linki/hooks/bash_guard.py"
+    }
+  ],
+  "PostToolUse": [
+    {
+      "matcher": "File(Write|Edit)Tool",
+      "command": "python .linki/hooks/auto_format.py"
+    }
+  ]
+}

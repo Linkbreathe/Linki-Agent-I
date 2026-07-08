@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,13 @@ SESSION_SUMMARY_FILE = "SESSION_SUMMARY.md"
 
 DEFAULT_WORKSPACE_BASE = "workspace"
 RUN_DIR_PREFIX = "run-"
+
+# Hook policy files live next to the project (the directory the CLI is invoked
+# from), but tools execute inside an ephemeral ``run-<timestamp>`` workspace and
+# ``load_hooks_config`` reads them relative to that workspace. Seed the policy
+# files into each new run so hook interception actually fires there.
+POLICY_HOOKS_CONFIG = ".linki/hooks.json"
+POLICY_HOOKS_DIR = ".linki/hooks"
 
 MAX_SESSION_CONTEXT = 7000
 MAX_TURN_CONTENT = 4000
@@ -64,12 +72,51 @@ def resolve_session_workspace(session_workspace: str | Path | None = None) -> Pa
     return workspace
 
 
-def create_run_workspace(base_dir: str | Path | None = None) -> Path:
+def seed_policy_files(workspace: Path, policy_source: str | Path | None = None) -> list[str]:
+    """Copy hook policy files from ``policy_source`` into ``workspace``.
+
+    Hook config (``.linki/hooks.json``) and scripts (``.linki/hooks/``) are
+    resolved by the executor relative to the active workspace. Because tools run
+    inside an ephemeral run folder, the policy must be seeded there or hooks
+    never match. Existing files in the destination are left untouched so a
+    resumed run keeps its own policy. Returns the workspace-relative paths seeded.
+    """
+
+    workspace = Path(workspace)
+    source = Path(policy_source or Path.cwd()).expanduser().resolve()
+    if source == workspace.resolve():
+        return []
+
+    seeded: list[str] = []
+
+    src_config = source / POLICY_HOOKS_CONFIG
+    dst_config = workspace / POLICY_HOOKS_CONFIG
+    if src_config.is_file() and not dst_config.exists():
+        dst_config.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src_config, dst_config)
+        seeded.append(POLICY_HOOKS_CONFIG)
+
+    src_dir = source / POLICY_HOOKS_DIR
+    dst_dir = workspace / POLICY_HOOKS_DIR
+    if src_dir.is_dir() and not dst_dir.exists():
+        shutil.copytree(src_dir, dst_dir)
+        seeded.append(POLICY_HOOKS_DIR + "/")
+
+    return seeded
+
+
+def create_run_workspace(
+    base_dir: str | Path | None = None,
+    *,
+    policy_source: str | Path | None = None,
+) -> Path:
     """Create and return a fresh run workspace under ``base_dir``.
 
     Each application start gets its own ``run-<timestamp>`` folder so a new run
     never overwrites the checkpoints of a previous one. ``base_dir`` is treated
-    as a parent directory and defaults to ``workspace``.
+    as a parent directory and defaults to ``workspace``. Hook policy files are
+    seeded from ``policy_source`` (defaults to the current working directory) so
+    hook interception fires inside the run workspace.
     """
 
     base = Path(base_dir or DEFAULT_WORKSPACE_BASE).expanduser().resolve()
@@ -84,6 +131,7 @@ def create_run_workspace(base_dir: str | Path | None = None) -> Path:
         suffix += 1
 
     candidate.mkdir(parents=True)
+    seed_policy_files(candidate, policy_source)
     return candidate
 
 

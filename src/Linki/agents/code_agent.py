@@ -9,6 +9,7 @@ from Linki.core.state import RuntimeState
 from Linki.graph.memory import LayeredMemory, build_layered_memory, format_layered_memory_for_prompt, memory_event
 from Linki.graph.state import TodoItem
 from Linki.providers.openai_provider import create_model
+from Linki.tools.executor import is_tool_result
 from Linki.tools.registry import build_tools
 
 CODE_AGENT_PROMPT = """You are codeAgent, a focused implementation specialist.
@@ -177,7 +178,10 @@ def _execute_call(call: dict, tools_by_name: Mapping[str, Any], todos: list[Todo
         return _tool_result(name, False, error=ValueError(f"Unknown tool: {name}"))
 
     try:
-        return _tool_result(name, True, output=tool.invoke(args))
+        output = tool.invoke(args)
+        if is_tool_result(output, name):
+            return output
+        return _tool_result(name, True, output=output)
     except Exception as exc:
         return _tool_result(name, False, error=exc)
 

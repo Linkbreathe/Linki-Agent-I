@@ -2,7 +2,10 @@
 .venv/
 .venv.broken*/
 workspace/
-.linki/
+.linki/*
+!.linki/hooks.json
+!.linki/hooks/
+!.linki/hooks/*.py
 __pycache__/
 *.py[cod]
 *.egg-info/
