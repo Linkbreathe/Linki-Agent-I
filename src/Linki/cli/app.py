@@ -107,7 +107,7 @@ def _tool_args_table(args: Any) -> Table | str:
     return table
 
 
-def _tool_result_table(result: Any) -> Table | str:
+def _tool_result_table(result: Any, *, tool_name: str | None = None) -> Table | str:
     if not isinstance(result, Mapping):
         return _compact_value("result", result, limit=1_000)
 
@@ -158,6 +158,17 @@ def _tool_result_table(result: Any) -> Table | str:
         output = parsed_output
 
     if isinstance(output, Mapping):
+        if tool_name == "AgentTool":
+            if output.get("subagent_type"):
+                table.add_row("Subagent", str(output.get("subagent_type")))
+            if output.get("description"):
+                table.add_row("Dispatch", str(output.get("description")))
+            if output.get("output"):
+                table.add_row("Result", _truncate_lines(str(output.get("output")), line_limit=8, char_limit=1_000))
+            if output.get("error"):
+                table.add_row("Error", _truncate_lines(str(output.get("error")), line_limit=5, char_limit=800))
+            return table
+
         updated = output.get("updated")
         if isinstance(updated, Mapping):
             table.add_row("Todo", _truncate(str(updated.get("content") or updated.get("id") or ""), 300))
@@ -169,6 +180,41 @@ def _tool_result_table(result: Any) -> Table | str:
     elif output is not None:
         table.add_row("Output", _compact_value("output", output, limit=900))
 
+    return table
+
+
+def _event_agent(event: Mapping[str, Any]) -> str:
+    return str(event.get("agent") or "")
+
+
+def _subagent_title(event: Mapping[str, Any], label: str) -> str:
+    agent = _event_agent(event)
+    return f"   {agent} · {label}" if agent else label
+
+
+def _hook_decision_renderable(event: Mapping[str, Any]) -> Table:
+    table = Table(show_header=False, box=None, padding=(0, 1))
+    table.add_column(style="bold", no_wrap=True)
+    table.add_column(overflow="fold")
+    table.add_row("Event", str(event.get("event") or ""))
+    table.add_row("Tool", str(event.get("tool") or ""))
+    table.add_row("Decision", str(event.get("decision") or ""))
+    if event.get("reason"):
+        table.add_row("Reason", _truncate_lines(str(event.get("reason")), line_limit=4, char_limit=700))
+    if event.get("hook"):
+        table.add_row("Hook", _truncate(str(event.get("hook")), 220))
+    return table
+
+
+def _approval_event_renderable(event: Mapping[str, Any]) -> Table:
+    table = Table(show_header=False, box=None, padding=(0, 1))
+    table.add_column(style="bold", no_wrap=True)
+    table.add_column(overflow="fold")
+    table.add_row("Tool", str(event.get("tool") or ""))
+    if event.get("command"):
+        table.add_row("Command", _truncate_lines(str(event.get("command")), line_limit=4, char_limit=700))
+    if event.get("reason"):
+        table.add_row("Reason", _truncate_lines(str(event.get("reason")), line_limit=4, char_limit=700))
     return table
 
 
@@ -508,6 +554,19 @@ def _print_event(event: dict, *, verbose: bool = False) -> None:
         )
         return
 
+    if event_type == "memory_extract":
+        added = int(event.get("added") or 0)
+        replaced = int(event.get("replaced") or 0)
+        if added or replaced:
+            console.print(
+                Panel(
+                    f"新增 {added} 条 / 覆盖 {replaced} 条\nTotal: {event.get('total', 0)}",
+                    title="🧠 记忆提取",
+                    border_style="blue",
+                )
+            )
+        return
+
     if event_type == "handoff":
         console.print(
             Panel(
@@ -522,8 +581,64 @@ def _print_event(event: dict, *, verbose: bool = False) -> None:
         console.print(
             Panel(
                 _search_results_renderable(event.get("result", {})),
-                title=f"🔎 Search: {event.get('query')}",
+                title=_subagent_title(event, f"🔎 Search: {event.get('query')}"),
                 border_style="cyan",
+            )
+        )
+        return
+
+    if event_type == "subagent_start":
+        tools = event.get("tools") or []
+        detail = str(event.get("description") or "")
+        if tools:
+            detail = f"{detail}\nTools: {', '.join(str(tool) for tool in tools)}"
+        console.print(
+            Panel(
+                detail,
+                title=f"🤖 {event.get('agent')} · {event.get('description')}",
+                border_style="magenta",
+            )
+        )
+        return
+
+    if event_type == "subagent_result":
+        console.print(
+            Panel(
+                str(event.get("summary") or ""),
+                title=f"↩ {event.get('agent')} conclusion",
+                border_style="magenta",
+            )
+        )
+        return
+
+    if event_type == "approval_requested":
+        console.print(
+            Panel(
+                _approval_event_renderable(event),
+                title=_subagent_title(event, "⚠ Approval requested"),
+                border_style="yellow",
+            )
+        )
+        return
+
+    if event_type == "hook_decision":
+        decision = str(event.get("decision") or "")
+        style = "red" if decision == "deny" else "yellow" if decision == "ask" else "green"
+        console.print(
+            Panel(
+                _hook_decision_renderable(event),
+                title=_subagent_title(event, f"🪝 Hook {decision or 'decision'}"),
+                border_style=style,
+            )
+        )
+        return
+
+    if event_type == "trace.warn" and event.get("event") in {"PreToolUse", "PostToolUse"}:
+        console.print(
+            Panel(
+                _json_block(event),
+                title=_subagent_title(event, f"⚠ Hook warning: {event.get('reason')}"),
+                border_style="yellow",
             )
         )
         return
@@ -532,6 +647,7 @@ def _print_event(event: dict, *, verbose: bool = False) -> None:
         node = event.get("node")
         name = event.get("name")
         title = f"Tool Call: {node}/{name}" if node else f"Tool Call: {name}"
+        title = _subagent_title(event, title)
         console.print(
             Panel(
                 _tool_args_table(event.get("args", {})),
@@ -547,9 +663,10 @@ def _print_event(event: dict, *, verbose: bool = False) -> None:
         name = event.get("name")
         ok = _tool_result_ok(result)
         title = f"Tool Result: {node}/{name}" if node else f"Tool Result: {name}"
+        title = _subagent_title(event, title)
         console.print(
             Panel(
-                _tool_result_table(result),
+                _tool_result_table(result, tool_name=str(name) if name else None),
                 title=title,
                 border_style="green" if ok else "red",
             )

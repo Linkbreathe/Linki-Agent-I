@@ -4,27 +4,24 @@ import subprocess
 from collections.abc import Iterable, Iterator, Mapping
 from typing import Any, cast
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from langgraph.config import get_stream_writer
-from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from pydantic import BaseModel, Field
 
 from Linki.agents.code_agent import run_code_agent
-from Linki.agents.search_agent import run_search_agent
+from Linki.core.compact import compact_pipeline
 from Linki.core.paths import ensure_workspace, resolve_workspace_path
 from Linki.core.state import RuntimeState
 from Linki.graph.memory import (
-    HISTORY_SUMMARY_FILENAME,
     CompressionEvent,
     LayeredMemory,
     _short_text,
-    _trim_handoffs,
     build_layered_memory,
     format_layered_memory_for_prompt,
     memory_event,
 )
-from Linki.graph.state import AgentHandoff, LinkiGraphState, SourceItem, TodoItem, VerificationCheck, VerificationResult
+from Linki.graph.state import AgentHandoff, LinkiGraphState, TodoItem, VerificationCheck, VerificationResult
 from Linki.providers.openai_provider import create_model
 from Linki.prompts.stage3 import (
     CHAT_RESPONDER_PROMPT,
@@ -33,10 +30,11 @@ from Linki.prompts.stage3 import (
     PLANNER_PROMPT,
     VERIFIER_PROMPT,
 )
-from Linki.prompts.stage4 import CONTEXT_COMPRESSION_PROMPT
+from Linki.tools.agent_tool import make_agent_tool
 from Linki.tools.ask_user_tool import DEFAULT_ASK_BUDGET, make_ask_user_question_tool
 from Linki.tools.bash_tool import _decode_timeout_output, _validate_workspace_command
 from Linki.tools.executor import is_tool_result
+from Linki.tools.memory_tools import make_memory_upsert_tool
 from Linki.tools.plan_tools import make_enter_plan_mode_tool, make_exit_plan_mode_tool
 from Linki.tools.registry import build_read_only_tools, build_tools
 
@@ -309,62 +307,6 @@ def _react_events(
             yield {**event, "message": tool_message}
 
 
-def _append_research_notes(existing: str, addition: str) -> str:
-    addition = addition.strip()
-    if not addition:
-        return existing
-    if not existing:
-        return addition
-    return f"{existing}\n\n{addition}"
-
-
-def _merge_sources(existing: list[SourceItem], new_sources: list[Any]) -> list[SourceItem]:
-    merged: dict[str, SourceItem] = {}
-    for item in list(existing) + list(new_sources or []):
-        if not isinstance(item, Mapping):
-            continue
-        url = str(item.get("url") or "")
-        if not url:
-            continue
-        merged[url] = {
-            "title": str(item.get("title") or ""),
-            "url": url,
-            "content": str(item.get("content") or ""),
-            "score": float(item.get("score") or 0.0),
-        }
-    return list(merged.values())
-
-
-def _call_search_agent_tool(state: dict[str, Any], writer: Any, instruction: str) -> dict:
-    writer(
-        {
-            "type": "handoff",
-            "from": "planner",
-            "to": "searchAgent",
-            "instruction": instruction,
-        }
-    )
-
-    result = run_search_agent(
-        state,
-        instruction,
-        writer=writer,
-    )
-
-    state["research_notes"] = _append_research_notes(state.get("research_notes", ""), str(result.get("summary", "")))
-    state["sources"] = _merge_sources(state.get("sources", []), result.get("sources", []))
-    state.setdefault("agent_handoffs", []).append(
-        {
-            "from_agent": "planner",
-            "to_agent": "searchAgent",
-            "instruction": instruction,
-            "result": str(result.get("summary", "")),
-        }
-    )
-
-    return result
-
-
 def _call_code_agent_tool(state: dict[str, Any], writer: Any, instruction: str) -> dict:
     writer(
         {
@@ -419,15 +361,6 @@ def _build_planner_tools(
         working.update(plan)
         return {"ok": True, "plan": plan}
 
-    def call_search_agent_tool(instruction: str) -> dict[str, Any]:
-        result = _call_search_agent_tool(working, _emit_custom_event, instruction)
-        return {
-            "ok": bool(result.get("ok", True)),
-            "summary": result.get("summary", ""),
-            "queries": result.get("queries", []),
-            "sources": result.get("sources", []),
-        }
-
     def call_code_agent_tool(instruction: str) -> dict[str, Any]:
         result = _call_code_agent_tool(working, _emit_custom_event, instruction)
         return {
@@ -442,11 +375,10 @@ def _build_planner_tools(
             name="TodoWriteTool",
             description="Publish or revise the plan, todos, acceptance criteria, and verification commands.",
         ),
-        StructuredTool.from_function(
-            func=call_search_agent_tool,
-            name="CallSearchAgentTool",
-            description="Delegate a research task to searchAgent.",
-        ),
+        # Research, documentation, and review are delegated to specialist
+        # subagents through the unified AgentTool.
+        make_agent_tool(working),
+        make_memory_upsert_tool(working),
     ]
 
     # A clarifying question is only offered while budget remains.
@@ -468,6 +400,29 @@ def _build_planner_tools(
         tools.append(make_enter_plan_mode_tool(working))
 
     return tools
+
+
+def _available_agents_block(working_state: Mapping[str, Any]) -> str:
+    """Render the registered subagents (name + description only) for the planner.
+
+    Built dynamically from the registry so new workspace agents appear without
+    code changes. System prompts are intentionally omitted.
+    """
+
+    runtime = working_state.get("runtime")
+    if runtime is None:
+        return ""
+    from Linki.agents.registry import load_agent_registry
+
+    registry = load_agent_registry(runtime)
+    if not registry:
+        return ""
+
+    lines = ["<available_agents>"]
+    for name in sorted(registry):
+        lines.append(f"- {name}: {registry[name].description}")
+    lines.append("</available_agents>")
+    return "\n".join(lines)
 
 
 def _planner_input(working_state: Mapping[str, Any], memory: LayeredMemory) -> str:
@@ -495,12 +450,15 @@ def _planner_input(working_state: Mapping[str, Any], memory: LayeredMemory) -> s
     if project_context:
         parts.append(project_context)
     parts.append(instruction)
+    available_agents = _available_agents_block(working_state)
+    if available_agents:
+        parts.append(available_agents)
     parts.append(format_layered_memory_for_prompt(memory))
     return "\n\n".join(parts)
 
 
 def planner_node(state: LinkiGraphState) -> dict:
-    """Run the planner/supervisor node: publish the plan and delegate to searchAgent/codeAgent."""
+    """Run the planner/supervisor node and delegate work through tools."""
 
     runtime = _runtime(state)
 
@@ -803,58 +761,7 @@ def context_monitor_route(state: LinkiGraphState) -> str:
 def context_compressor_node(state: LinkiGraphState) -> dict:
     """Compress the message history and durable context into one summary."""
 
-    runtime = _runtime(state)
-    model = _model(state)
-    messages = list(state.get("messages", []))
-    memory_payload = format_layered_memory_for_prompt(
-        build_layered_memory(state, node="context_compressor")
-    )
-
-    compression_input = "\n\n".join(
-        [
-            f"Current messages:\n{_format_json([_message_content(message) for message in messages])}",
-            f"Layered memory snapshot:\n{memory_payload}",
-        ]
-    )
-
-    response = model.invoke(
-        [
-            SystemMessage(content=CONTEXT_COMPRESSION_PROMPT),
-            HumanMessage(content=compression_input),
-        ]
-    )
-    response_text = _message_content(response)
-    payload = _json_from_text(response_text)
-    summary = _format_json(payload) if payload else response_text
-
-    resolve_workspace_path(runtime, HISTORY_SUMMARY_FILENAME).write_text(summary, encoding="utf-8")
-
-    new_token_count = _estimate_token_count(model, [AIMessage(content=summary)], "")
-
-    compression_event: CompressionEvent = {
-        "node": "context_compressor",
-        "reason": "context_token_count exceeded context_token_limit",
-        "token_count": int(state.get("context_token_count", 0)),
-        "token_limit": int(state.get("context_token_limit") or CONTEXT_TOKEN_LIMIT_DEFAULT),
-        "summary": _short_text(summary, 400),
-    }
-
-    return {
-        "messages": [
-            RemoveMessage(id=REMOVE_ALL_MESSAGES),
-            AIMessage(content=summary),
-        ],
-        "context_summary": summary,
-        "context_token_count": new_token_count,
-        "context_should_compress": False,
-        "research_notes": _short_text(state.get("research_notes", ""), 1600),
-        "agent_handoffs": _trim_handoffs(state.get("agent_handoffs", [])),
-        "code_agent_summary": _short_text(state.get("code_agent_summary", ""), 1000),
-        "last_actor_summary": _short_text(state.get("last_actor_summary", ""), 1000),
-        "last_error": _short_text(state.get("last_error", ""), 1400),
-        "history_summary": summary,
-        "compression_events": [*state.get("compression_events", []), compression_event],
-    }
+    return compact_pipeline(state, focus=None, trigger="auto")
 
 
 def context_compressor_route(state: LinkiGraphState) -> str:

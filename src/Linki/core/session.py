@@ -20,6 +20,7 @@ RUN_DIR_PREFIX = "run-"
 # files into each new run so hook interception actually fires there.
 POLICY_HOOKS_CONFIG = ".linki/hooks.json"
 POLICY_HOOKS_DIR = ".linki/hooks"
+POLICY_AGENTS_DIR = ".linki/agents"
 
 MAX_SESSION_CONTEXT = 7000
 MAX_TURN_CONTENT = 4000
@@ -96,11 +97,12 @@ def seed_policy_files(workspace: Path, policy_source: str | Path | None = None) 
         shutil.copy2(src_config, dst_config)
         seeded.append(POLICY_HOOKS_CONFIG)
 
-    src_dir = source / POLICY_HOOKS_DIR
-    dst_dir = workspace / POLICY_HOOKS_DIR
-    if src_dir.is_dir() and not dst_dir.exists():
-        shutil.copytree(src_dir, dst_dir)
-        seeded.append(POLICY_HOOKS_DIR + "/")
+    for policy_dir in (POLICY_HOOKS_DIR, POLICY_AGENTS_DIR):
+        src_dir = source / policy_dir
+        dst_dir = workspace / policy_dir
+        if src_dir.is_dir() and not dst_dir.exists():
+            shutil.copytree(src_dir, dst_dir)
+            seeded.append(policy_dir + "/")
 
     return seeded
 

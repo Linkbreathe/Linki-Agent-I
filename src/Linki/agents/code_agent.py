@@ -5,14 +5,17 @@ from typing import Any
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from pydantic import BaseModel, Field
 
+from Linki.agents.registry import load_agent_registry
 from Linki.core.state import RuntimeState
 from Linki.graph.memory import LayeredMemory, build_layered_memory, format_layered_memory_for_prompt, memory_event
 from Linki.graph.state import TodoItem
 from Linki.providers.openai_provider import create_model
+from Linki.prompts.memory import AGENT_MEMORY_INSTRUCTIONS
+from Linki.tools.agent_tool import make_agent_tool
 from Linki.tools.executor import is_tool_result
 from Linki.tools.registry import build_tools
 
-CODE_AGENT_PROMPT = """You are codeAgent, a focused implementation specialist.
+CODE_AGENT_PROMPT = f"""You are codeAgent, a focused implementation specialist.
 
 You implement the planner's instruction inside the workspace using file and
 shell tools.
@@ -29,9 +32,15 @@ Rules:
 - Use NotepadAppendTool to record durable findings, decisions, important files,
   blockers, and next-step context that should survive compression.
 - Use NotepadReadTool when you need to recover prior notes.
+- For auxiliary work such as documentation or review, dispatch a specialist via
+  AgentTool. Available types are listed in <available_agents>. Give each
+  dispatch a self-contained prompt because the subagent cannot see this
+  conversation.
 - BashTool already runs inside the workspace. Use relative paths, never "cd /workspace".
 - Incorporate research notes and source URLs when the task asks for researched content.
 - End with a concise summary of files changed and checks run.
+
+{AGENT_MEMORY_INSTRUCTIONS}
 """
 
 TODO_STATUSES = {"pending", "in_progress", "completed", "blocked"}
@@ -129,6 +138,23 @@ def _session_context(state: Any) -> str:
     return _format_json(context)
 
 
+def _available_agents_block(state: Any) -> str:
+    values = state if isinstance(state, Mapping) else {}
+    runtime = values.get("runtime")
+    if runtime is None:
+        return ""
+
+    registry = load_agent_registry(runtime)
+    if not registry:
+        return ""
+
+    lines = ["<available_agents>"]
+    for name in sorted(registry):
+        lines.append(f"- {name}: {registry[name].description}")
+    lines.append("</available_agents>")
+    return "\n".join(lines)
+
+
 def _code_agent_input(state: Any, instruction: str, memory: LayeredMemory) -> str:
     values = state if isinstance(state, Mapping) else {}
     parts: list[str] = []
@@ -141,8 +167,13 @@ def _code_agent_input(state: Any, instruction: str, memory: LayeredMemory) -> st
         f"Task:\n{values.get('task', '')}",
         f"Instruction:\n{instruction}",
         f"Session context:\n{_session_context(state)}",
-        format_layered_memory_for_prompt(memory),
     ]
+
+    available_agents = _available_agents_block(state)
+    if available_agents:
+        parts.append(available_agents)
+
+    parts.append(format_layered_memory_for_prompt(memory))
 
     return "\n\n".join(parts)
 
@@ -207,6 +238,9 @@ def run_code_agent(
         plan_mode=bool(values.get("plan_mode")),
         ask_budget_left=values.get("ask_budget"),
     )
+    # codeAgent may dispatch specialist subagents (e.g. doc-writer, reviewer).
+    if runtime is not None:
+        tools = tools + [make_agent_tool(state)]
     tools_by_name = {tool.name: tool for tool in tools}
 
     todos = [_todo_dict(todo, index) for index, todo in enumerate(values.get("todos") or [])]

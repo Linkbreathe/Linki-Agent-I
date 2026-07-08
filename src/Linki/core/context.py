@@ -16,9 +16,11 @@ import subprocess
 from pathlib import Path
 
 from Linki.core.state import RuntimeState
+from Linki.core.memory_store import MEMORY_PATH
 
 LINKI_FILENAME = "LINKI.md"
 PROJECT_RULES_LIMIT = 4000
+PROJECT_MEMORY_LIMIT = 20 * 1024
 GIT_TIMEOUT_SECONDS = 5
 RECENT_COMMITS = 5
 
@@ -40,6 +42,16 @@ def read_project_rules(state: RuntimeState) -> str | None:
     """
 
     path = Path(state.workspace) / LINKI_FILENAME
+    try:
+        if not path.is_file():
+            return None
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def read_project_memory(state: RuntimeState) -> str | None:
+    path = Path(state.workspace) / MEMORY_PATH
     try:
         if not path.is_file():
             return None
@@ -119,6 +131,14 @@ def assemble_project_context(state: RuntimeState) -> str:
             "<project_rules>\n"
             f"{_truncate(rules, PROJECT_RULES_LIMIT)}\n"
             "</project_rules>"
+        )
+
+    memory = read_project_memory(state)
+    if memory is not None:
+        sections.append(
+            "<project_memory>\n"
+            f"{_truncate(memory, PROJECT_MEMORY_LIMIT)}\n"
+            "</project_memory>"
         )
 
     project_state = _format_project_state(state)

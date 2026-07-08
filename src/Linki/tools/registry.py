@@ -5,7 +5,32 @@ from Linki.tools.bash_tool import BashTool
 from Linki.tools.executor import execute_tool
 from Linki.tools.file_tools import FileEditTool, FileReadTool, FileWriteTool
 from Linki.tools.grep_tool import GrepTool
+from Linki.tools.memory_tools import make_memory_upsert_tool
+from Linki.tools.notepad_tool import NotepadAppendTool, NotepadReadTool
+from Linki.tools.web_search_tool import WebSearchTool
 
+
+# The AgentTool dispatches subagents; it is registered onto the planner and
+# codeAgent pools but is never handed to a subagent (see agent_tool.run_subagent).
+AGENT_TOOL_NAME = "AgentTool"
+
+# Every tool name an agent definition may reference. Agent definitions are
+# validated against this set at registry-load time so an unknown tool aborts
+# startup instead of failing silently at dispatch.
+KNOWN_TOOL_NAMES = frozenset(
+    {
+        "FileReadTool",
+        "FileWriteTool",
+        "FileEditTool",
+        "GrepTool",
+        "BashTool",
+        "WebSearchTool",
+        "NotepadReadTool",
+        "NotepadAppendTool",
+        "MemoryUpsertTool",
+        AGENT_TOOL_NAME,
+    }
+)
 
 # Tools that mutate the workspace or run commands; withheld in plan mode.
 _MUTATING_TOOLS = {"FileWriteTool", "FileEditTool", "BashTool"}
@@ -113,8 +138,9 @@ def build_tools(
 
     if plan_mode:
         tools = [tool for tool in tools if tool.name not in _MUTATING_TOOLS]
+        return tools
 
-    return tools
+    return tools + [make_memory_upsert_tool(state)]
 
 
 def build_read_only_tools(state: RuntimeState) -> list[StructuredTool]:
@@ -163,3 +189,48 @@ def build_read_only_tools(state: RuntimeState) -> list[StructuredTool]:
             description="Search files within the workspace using a regular expression.",
         ),
     ]
+
+
+def build_subagent_tools(state: RuntimeState) -> list[StructuredTool]:
+    """Build the full superset of workspace tools available to subagents.
+
+    ``run_subagent`` filters this pool down to the tools named in the agent
+    definition's allowlist. Unlike :func:`build_tools`, this includes research
+    (WebSearchTool) and durable-notes (NotepadReadTool/NotepadAppendTool) tools,
+    but never the AgentTool — subagents cannot dispatch further subagents.
+    Every tool call still flows through :func:`execute_tool` so the hook,
+    risk-classification, and approval pipeline stays active inside subagents.
+    """
+
+    web_search = WebSearchTool()
+    notepad_read = NotepadReadTool(state)
+    notepad_append = NotepadAppendTool(state)
+
+    def web_search_tool(query: str) -> dict:
+        return execute_tool(state, "WebSearchTool", {"query": query}, web_search)
+
+    def notepad_read_tool() -> dict:
+        return execute_tool(state, "NotepadReadTool", {}, notepad_read)
+
+    def notepad_append_tool(note: str) -> dict:
+        return execute_tool(state, "NotepadAppendTool", {"note": note}, notepad_append)
+
+    extra = [
+        StructuredTool.from_function(
+            func=web_search_tool,
+            name="WebSearchTool",
+            description="Search the web for factual information and return sources.",
+        ),
+        StructuredTool.from_function(
+            func=notepad_read_tool,
+            name="NotepadReadTool",
+            description="Read the workspace durable notes (NOTEPAD.md).",
+        ),
+        StructuredTool.from_function(
+            func=notepad_append_tool,
+            name="NotepadAppendTool",
+            description="Append a durable note to the workspace NOTEPAD.md.",
+        ),
+    ]
+
+    return build_tools(state) + extra

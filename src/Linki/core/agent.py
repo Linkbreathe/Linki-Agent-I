@@ -8,6 +8,7 @@ from langchain_core.messages import BaseMessage
 from Linki.core.checkpoint import CheckpointManager, resume_command
 from Linki.core.context import assemble_project_context
 from Linki.core.hooks import load_hooks_config
+from Linki.core.memory_store import extract_run_memories
 from Linki.core.paths import ensure_workspace
 from Linki.core.session import (
     append_assistant_turn,
@@ -362,6 +363,17 @@ def stream_agent_events(
         if checkpoint_event is not None:
             trace.record_custom_event(checkpoint_event)
 
+        memory_stats = extract_run_memories(current_state)
+        if memory_stats.get("added") or memory_stats.get("replaced"):
+            memory_event = {
+                "type": "memory_extract",
+                "added": memory_stats.get("added", 0),
+                "replaced": memory_stats.get("replaced", 0),
+                "total": memory_stats.get("total", 0),
+            }
+            trace.record_custom_event(memory_event)
+            yield {"type": "custom_event", "event": memory_event}
+
         trace_summary = trace.end(
             status="finished",
             latest_node=latest_node,
@@ -465,6 +477,7 @@ def stream_session_events(
         trace_mode=trace_mode,
     )
     ensure_workspace(runtime, create=True)
+    load_hooks_config(runtime)
 
     session = load_or_create_session(workspace)
     turn = append_user_turn(session, task)

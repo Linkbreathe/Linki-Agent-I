@@ -10,6 +10,7 @@ from langchain_core.messages import ToolMessage
 
 from Linki.core.approval import ApprovalDecision, ApprovalRequest
 from Linki.core.hooks import match_hooks, load_hooks_config
+from Linki.core.agent import stream_session_events
 from Linki.core.session import create_run_workspace, seed_policy_files
 from Linki.core.state import create_runtime
 from Linki.graph.nodes import _execute_call
@@ -156,6 +157,19 @@ def test_invalid_hooks_json_raises(tmp_path: Path) -> None:
         pass
     else:
         raise AssertionError("invalid hooks JSON should raise")
+
+
+def test_invalid_hooks_json_aborts_session_startup(tmp_path: Path) -> None:
+    config_path = tmp_path / ".linki" / "hooks.json"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text("{bad json", encoding="utf-8")
+
+    try:
+        next(stream_session_events("hello", session_workspace=tmp_path, model=object()))
+    except json.JSONDecodeError:
+        pass
+    else:
+        raise AssertionError("invalid hooks JSON should abort session startup")
 
 
 def test_matcher_star_matches_any_tool_and_regex_is_fullmatch(tmp_path: Path) -> None:

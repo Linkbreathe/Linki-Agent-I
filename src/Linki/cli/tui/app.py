@@ -5,6 +5,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from rich.table import Table
 from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
@@ -17,7 +18,10 @@ from Linki.cli.tui.approval import ApprovalGate, ApprovalModal, ApprovalRequeste
 from Linki.cli.tui.logo import animate_logo, build_logo
 from Linki.core.agent import _parse_graph_event, stream_session_events
 from Linki.core.approval import KIND_PLAN, KIND_QUESTION, ApprovalDecision, ApprovalRequest
+from Linki.core.compact import compact_pipeline
+from Linki.core.memory_store import append_user_memory, delete_memory, existing_entries
 from Linki.core.session import load_or_create_session, resolve_session_workspace
+from Linki.core.state import create_runtime
 
 # Rendering for each todo status: (icon, rich style).
 TODO_RENDER = {
@@ -31,6 +35,8 @@ PROGRESS_BAR_WIDTH = 18
 # Slash commands offered by the input autocomplete: (name, description).
 SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/plan", "Run this turn in plan mode"),
+    ("/compact", "Compress retained context now"),
+    ("/memory", "List or remove saved memory"),
     ("/resume", "Resume the latest checkpoint"),
 ]
 
@@ -125,6 +131,8 @@ class LinkiTuiApp(App[None]):
     #events Collapsible.evt-success { background: $success 20%; }
     #events Collapsible.evt-error { background: $error 25%; }
     #events Collapsible.evt-handoff { background: $secondary 22%; }
+    #events Collapsible.evt-subagent { background: $secondary 14%; border-left: solid $secondary; }
+    #events Collapsible.evt-hook { background: $warning 10%; border-left: solid $warning; }
     #events Collapsible.evt-system { background: $foreground 5%; }
 
     #final {
@@ -231,6 +239,7 @@ class LinkiTuiApp(App[None]):
         self._plan_summary: str = ""
         self._session_id: str = ""
         self._state_label: str = "starting"
+        self._last_messages: list[Any] = []
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -359,21 +368,108 @@ class LinkiTuiApp(App[None]):
             return
         self.query_one("#input", Input).value = ""
 
-        plan_mode = self.plan_mode
-        if value == "/plan" or value.startswith("/plan "):
-            plan_mode = True
-            value = value[len("/plan"):].strip()
-            if not value:
-                self._write_event("📝 Plan mode armed — type your task and press Enter.", kind="system")
+        if value.startswith("# "):
+            text = value[2:].strip()
+            if text:
+                runtime = create_runtime(self.workspace)
+                append_user_memory(runtime, text)
+                self._write_event(f"✏️ 已写入记忆（user）：{text}", kind="system")
+            return
+
+        if value.startswith("/"):
+            if self._handle_slash_command(value):
                 return
-        elif value == "/resume" or value.startswith("/resume"):
+            available = ", ".join(name for name, _ in SLASH_COMMANDS)
+            self._write_event(f"Unknown command: {value.split()[0]} · available: {available}", kind="error")
+            return
+
+        self._start_turn(value, plan_mode=self.plan_mode)
+
+    def _handle_slash_command(self, value: str) -> bool:
+        if value == "/plan" or value.startswith("/plan "):
+            task = value[len("/plan"):].strip()
+            if not task:
+                self._write_event("📝 Plan mode armed — type your task and press Enter.", kind="system")
+                return True
+            self._start_turn(task, plan_mode=True)
+            return True
+
+        if value == "/resume" or value.startswith("/resume"):
             self._write_event(
                 "ℹ️ /resume is a startup flag — restart with: linki --resume <workspace>",
                 kind="system",
             )
-            return
+            return True
 
-        self._start_turn(value, plan_mode=plan_mode)
+        if value == "/compact" or value.startswith("/compact "):
+            focus = value[len("/compact"):].strip() or None
+            self._run_manual_compact(focus)
+            return True
+
+        if value == "/memory":
+            self._show_memory()
+            return True
+
+        if value.startswith("/memory rm "):
+            raw_index = value[len("/memory rm "):].strip()
+            try:
+                remaining = delete_memory(create_runtime(self.workspace), int(raw_index))
+            except (ValueError, IndexError) as exc:
+                self._write_event(f"❌ Memory remove failed: {exc}", kind="error")
+                return True
+            self._write_event(f"🧠 记忆已删除，剩余 {remaining} 条", kind="system")
+            return True
+
+        return False
+
+    def _show_memory(self) -> None:
+        entries = existing_entries(create_runtime(self.workspace))
+        if not entries:
+            self._write_event("🧠 记忆为空", kind="system")
+            return
+        table = Table(show_header=True, header_style="bold")
+        table.add_column("#", justify="right", no_wrap=True)
+        table.add_column("Date", no_wrap=True)
+        table.add_column("Source", no_wrap=True)
+        table.add_column("Memory", overflow="fold")
+        for index, entry in enumerate(entries, start=1):
+            source = entry.source if entry.source == "user" or not entry.run_id else f"{entry.source}@{entry.run_id}"
+            table.add_row(str(index), entry.date, source, entry.text)
+        self._write_event("🧠 记忆", detail=table, kind="system")
+
+    def _run_manual_compact(self, focus: str | None) -> None:
+        events: list[dict[str, Any]] = []
+        runtime = create_runtime(
+            self.workspace,
+            approval_mode=self.approval_mode,
+            checkpoint_mode=self.checkpoint_mode,
+            trace_mode=self.trace_mode,
+            event_handler=events.append,
+        )
+        state = {
+            "runtime": runtime,
+            "messages": self._last_messages,
+            "acceptance_criteria": [],
+            "compression_events": [],
+            "context_token_limit": 400_000,
+            "context_token_count": 0,
+        }
+        updates = compact_pipeline(state, focus=focus, trigger="manual")
+        messages = updates.get("messages")
+        if isinstance(messages, list):
+            self._last_messages = messages
+        for event in events:
+            self._handle_event(event)
+        token_count = updates.get("context_token_count", 0)
+        retained = 0
+        compression_events = updates.get("compression_events") or []
+        if compression_events:
+            retained = int(compression_events[-1].get("tail_messages") or 0)
+        self._write_event(
+            f"🗜 Compact complete · tokens: {token_count} · retained: {retained}",
+            detail=updates,
+            kind="system",
+        )
 
     def on_agent_event_message(self, message: AgentEventMessage) -> None:
         self._handle_event(message.event)
@@ -425,9 +521,13 @@ class LinkiTuiApp(App[None]):
         self.query_one("#session", Static).update(line)
 
     def _write_event(self, summary: str, detail: Any = None, kind: str = "system") -> None:
-        body = self._format_detail(detail) if detail is not None else summary
+        if detail is not None and hasattr(detail, "__rich_console__"):
+            renderable = detail
+        else:
+            body = self._format_detail(detail) if detail is not None else summary
+            renderable = Text(body)
         collapsible = Collapsible(
-            Static(Text(body)),
+            Static(renderable),
             title=summary,
             collapsed=True,
             classes=f"evt-{kind}",
@@ -435,6 +535,22 @@ class LinkiTuiApp(App[None]):
         events = self.query_one("#events", VerticalScroll)
         events.mount(collapsible)
         events.scroll_end(animate=False)
+
+    def _subagent_prefix(self, event: dict[str, Any]) -> str:
+        agent = event.get("agent")
+        return f"   {agent} · " if agent else ""
+
+    def _event_kind(self, event: dict[str, Any], fallback: str) -> str:
+        return "subagent" if event.get("agent") and fallback in {"tool", "success"} else fallback
+
+    @staticmethod
+    def _hook_decision_label(event: dict[str, Any]) -> tuple[str, str]:
+        decision = str(event.get("decision") or "allow")
+        if decision == "deny":
+            return "⛔ Hook denied", "error"
+        if decision == "ask":
+            return "⚠ Hook escalated", "hook"
+        return "🪝 Hook allowed", "hook"
 
     def _refresh_plan(self) -> None:
         self.query_one("#plan", Static).update(self._render_plan())
@@ -535,6 +651,8 @@ class LinkiTuiApp(App[None]):
 
     @staticmethod
     def _format_detail(detail: Any) -> str:
+        if isinstance(detail, str):
+            return detail
         try:
             return json.dumps(detail, indent=2, ensure_ascii=False, default=str)
         except TypeError:
@@ -640,8 +758,11 @@ class LinkiTuiApp(App[None]):
             name = event.get("name")
             args = event.get("args") or {}
             detail = self._tool_detail(name, args)
+            prefix = self._subagent_prefix(event)
             self._write_event(
-                f"🔧 {name} → {detail}" if detail else f"🔧 {name}", detail=event, kind="tool"
+                f"{prefix}🔧 {name} → {detail}" if detail else f"{prefix}🔧 {name}",
+                detail=event,
+                kind=self._event_kind(event, "tool"),
             )
             return
 
@@ -650,10 +771,22 @@ class LinkiTuiApp(App[None]):
             if self._sync_todos_from_tool(event.get("name"), result):
                 self._refresh_plan()
             ok = self._tool_ok(result)
+            prefix = self._subagent_prefix(event)
+            name = event.get("name") or "Tool"
+            if name == "AgentTool" and isinstance(result.get("output"), dict):
+                output = result["output"]
+                subagent = output.get("subagent_type") or "subagent"
+                dispatch = output.get("description") or ""
+                self._write_event(
+                    f"{'✅' if ok else '❌'} AgentTool → {subagent}" + (f" · {dispatch}" if dispatch else ""),
+                    detail=event,
+                    kind="subagent" if ok else "error",
+                )
+                return
             self._write_event(
-                "✅ Tool completed" if ok else "❌ Tool failed",
+                f"{prefix}{'✅' if ok else '❌'} {name}",
                 detail=event,
-                kind="success" if ok else "error",
+                kind=self._event_kind(event, "success") if ok else "error",
             )
             return
 
@@ -671,7 +804,60 @@ class LinkiTuiApp(App[None]):
             return
 
         if event_type == "search_results":
-            self._write_event(f"🔍 Search results received: {event.get('query')}", detail=event, kind="tool")
+            prefix = self._subagent_prefix(event)
+            self._write_event(
+                f"{prefix}🔍 Search results: {event.get('query')}",
+                detail=event,
+                kind=self._event_kind(event, "tool"),
+            )
+            return
+
+        if event_type == "approval_requested":
+            prefix = self._subagent_prefix(event)
+            tool = event.get("tool") or "tool"
+            reason = self._truncate(str(event.get("reason") or ""), 120)
+            suffix = f" · {reason}" if reason else ""
+            self._write_event(f"{prefix}⚠ Approval requested: {tool}{suffix}", detail=event, kind="error")
+            return
+
+        if event_type == "hook_decision":
+            prefix = self._subagent_prefix(event)
+            label, kind = self._hook_decision_label(event)
+            tool = event.get("tool") or "tool"
+            reason = self._truncate(str(event.get("reason") or ""), 120)
+            suffix = f" · {reason}" if reason else ""
+            self._write_event(f"{prefix}{label}: {tool}{suffix}", detail=event, kind=kind)
+            return
+
+        if event_type == "trace.warn" and event.get("event") in {"PreToolUse", "PostToolUse"}:
+            prefix = self._subagent_prefix(event)
+            tool = event.get("tool") or "tool"
+            self._write_event(
+                f"{prefix}⚠ Hook warning: {tool} · {event.get('reason')}",
+                detail=event,
+                kind="hook",
+            )
+            return
+
+        if event_type == "subagent_start":
+            agent = event.get("agent")
+            description = event.get("description") or ""
+            tools = event.get("tools") or []
+            suffix = f" · tools: {', '.join(str(tool) for tool in tools)}" if tools else ""
+            self._write_event(f"🤖 {agent} · {description}{suffix}", detail=event, kind="subagent")
+            return
+
+        if event_type == "subagent_result":
+            prefix = self._subagent_prefix(event)
+            summary = self._truncate(str(event.get("summary") or ""))
+            self._write_event(f"{prefix}↩ Conclusion: {summary}", detail=event, kind="subagent")
+            return
+
+        if event_type == "memory_extract":
+            added = int(event.get("added") or 0)
+            replaced = int(event.get("replaced") or 0)
+            if added or replaced:
+                self._write_event(f"🧠 记忆提取：新增 {added} 条 / 覆盖 {replaced} 条", detail=event, kind="system")
             return
 
         if event_type == "checkpoint_saved":
@@ -726,6 +912,9 @@ class LinkiTuiApp(App[None]):
             return
 
         if node == "planner":
+            messages = data.get("messages")
+            if isinstance(messages, list):
+                self._last_messages = messages
             self._write_event("📋 Plan updated", detail=data, kind="plan")
             return
 

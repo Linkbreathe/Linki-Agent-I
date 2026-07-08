@@ -3,7 +3,7 @@ from pathlib import Path
 from Linki.core.paths import resolve_workspace_path
 from Linki.core.state import RuntimeState
 
-PROTECTED_PATHS = (".linki/hooks.json", ".linki/hooks/")
+PROTECTED_PATHS = (".linki/hooks.json", ".linki/hooks/", ".linki/memory/")
 PROTECTED_PATH_ERROR = "protected path: 策略文件对 Agent 只读"
 
 
@@ -41,6 +41,7 @@ class FileReadTool:
             raise FileNotFoundError(f"File not found: {file_path}")
 
         lines = path.read_text(encoding="utf-8").splitlines()
+        self.state.touch_file(path)
         selected = lines[offset:] if limit is None else lines[offset : offset + limit]
         return "\n".join(selected)
 
@@ -57,6 +58,7 @@ class FileWriteTool:
         path = resolve_workspace_path(self.state, file_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
+        self.state.touch_file(path)
         return f"Wrote {_display_path(self.state, path)}"
 
 
@@ -84,4 +86,5 @@ class FileEditTool:
             raise ValueError("old_text appears multiple times; provide a unique fragment")
 
         path.write_text(content.replace(old_text, new_text, 1), encoding="utf-8")
+        self.state.touch_file(path)
         return f"Edited {_display_path(self.state, path)}"

@@ -102,11 +102,18 @@ def _timeline_entry_line(entry: Mapping[str, Any]) -> str:
         if nodes:
             event_type = "graph_update"
             node = ", ".join(nodes)
+    agent = event.get("agent")
     label = event_type + (f" @ {node}" if node else "")
+    if agent:
+        label = f"{label} [{agent}]"
 
     detail = ""
     if event_type in {"ai_message", "node_update"}:
         detail = str(event.get("content", ""))[:160]
+    elif event_type == "subagent_start":
+        detail = str(event.get("description") or "")
+    elif event_type == "subagent_result":
+        detail = str(event.get("summary") or "")[:160]
     elif event_type == "graph_update":
         detail = ", ".join(_updated_nodes(event))
     elif event_type in {"tool_call", "tool_result"}:
