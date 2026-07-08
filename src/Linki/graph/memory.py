@@ -12,6 +12,7 @@ import json
 from collections.abc import Mapping
 from typing import Any, TypedDict
 
+from Linki.core.context import PROJECT_RULES_LIMIT, read_project_rules
 from Linki.core.paths import resolve_workspace_path
 from Linki.core.state import RuntimeState
 
@@ -109,6 +110,16 @@ def _trim_handoffs(handoffs: list[Any]) -> list[Any]:
     return list(handoffs[-6:])
 
 
+def _build_rules_layer(runtime: RuntimeState) -> dict[str, Any]:
+    """Return the base rules layer, merging in workspace LINKI.md when present."""
+
+    rules = dict(RULES_LAYER)
+    project_rules = read_project_rules(runtime)
+    if project_rules:
+        rules["project_rules"] = _short_text(project_rules, PROJECT_RULES_LIMIT)
+    return rules
+
+
 def build_layered_memory(state: Mapping[str, Any], *, node: str = "graph") -> LayeredMemory:
     runtime = state["runtime"]
 
@@ -184,7 +195,7 @@ def build_layered_memory(state: Mapping[str, Any], *, node: str = "graph") -> La
     }
 
     return {
-        "rules": dict(RULES_LAYER),
+        "rules": _build_rules_layer(runtime),
         "working_memory": working_memory,
         "history_summary_store": history_summary_store,
     }

@@ -26,9 +26,17 @@ from Linki.graph.memory import (
 )
 from Linki.graph.state import AgentHandoff, LinkiGraphState, SourceItem, TodoItem, VerificationCheck, VerificationResult
 from Linki.providers.openai_provider import create_model
-from Linki.prompts.stage3 import CHAT_RESPONDER_PROMPT, INTENT_ROUTER_PROMPT, PLANNER_PROMPT, VERIFIER_PROMPT
+from Linki.prompts.stage3 import (
+    CHAT_RESPONDER_PROMPT,
+    INTENT_ROUTER_PROMPT,
+    PLANNER_PLAN_MODE_PROMPT,
+    PLANNER_PROMPT,
+    VERIFIER_PROMPT,
+)
 from Linki.prompts.stage4 import CONTEXT_COMPRESSION_PROMPT
+from Linki.tools.ask_user_tool import DEFAULT_ASK_BUDGET, make_ask_user_question_tool
 from Linki.tools.bash_tool import _decode_timeout_output, _validate_workspace_command
+from Linki.tools.plan_tools import make_enter_plan_mode_tool, make_exit_plan_mode_tool
 from Linki.tools.registry import build_read_only_tools, build_tools
 
 
@@ -384,7 +392,12 @@ def _call_code_agent_tool(state: dict[str, Any], writer: Any, instruction: str) 
     return result
 
 
-def _build_planner_tools(working: dict[str, Any]) -> list[StructuredTool]:
+def _build_planner_tools(
+    working: dict[str, Any],
+    *,
+    plan_mode: bool = False,
+    ask_budget_left: int = DEFAULT_ASK_BUDGET,
+) -> list[StructuredTool]:
     def todo_write_tool(
         plan_summary: str,
         todos: list[TodoItemSchema],
@@ -419,7 +432,7 @@ def _build_planner_tools(working: dict[str, Any]) -> list[StructuredTool]:
             "todos": result.get("todos", []),
         }
 
-    return [
+    tools = [
         StructuredTool.from_function(
             func=todo_write_tool,
             name="TodoWriteTool",
@@ -430,12 +443,27 @@ def _build_planner_tools(working: dict[str, Any]) -> list[StructuredTool]:
             name="CallSearchAgentTool",
             description="Delegate a research task to searchAgent.",
         ),
-        StructuredTool.from_function(
-            func=call_code_agent_tool,
-            name="CallCodeAgentTool",
-            description="Delegate an implementation task to codeAgent.",
-        ),
     ]
+
+    # A clarifying question is only offered while budget remains.
+    if ask_budget_left > 0:
+        tools.append(make_ask_user_question_tool(working))
+
+    if plan_mode:
+        # Plan mode is read-and-research only: no code delegation; submit the
+        # finished plan for review instead.
+        tools.append(make_exit_plan_mode_tool(working))
+    else:
+        tools.append(
+            StructuredTool.from_function(
+                func=call_code_agent_tool,
+                name="CallCodeAgentTool",
+                description="Delegate an implementation task to codeAgent.",
+            )
+        )
+        tools.append(make_enter_plan_mode_tool(working))
+
+    return tools
 
 
 def _planner_input(working_state: Mapping[str, Any], memory: LayeredMemory) -> str:
@@ -458,7 +486,13 @@ def _planner_input(working_state: Mapping[str, Any], memory: LayeredMemory) -> s
             ]
         )
 
-    return "\n\n".join([instruction, format_layered_memory_for_prompt(memory)])
+    parts: list[str] = []
+    project_context = str(working_state.get("project_context") or "").strip()
+    if project_context:
+        parts.append(project_context)
+    parts.append(instruction)
+    parts.append(format_layered_memory_for_prompt(memory))
+    return "\n\n".join(parts)
 
 
 def planner_node(state: LinkiGraphState) -> dict:
@@ -469,6 +503,7 @@ def planner_node(state: LinkiGraphState) -> dict:
     working: dict[str, Any] = {
         "task": state.get("task", ""),
         "runtime": runtime,
+        "project_context": state.get("project_context", ""),
         "provider": state.get("provider", "openai"),
         "model_name": state.get("model_name"),
         "model": state.get("model"),
@@ -487,24 +522,48 @@ def planner_node(state: LinkiGraphState) -> dict:
         "max_attempts": state.get("max_attempts", 3),
         "context_summary": state.get("context_summary", ""),
         "compression_events": list(state.get("compression_events", [])),
+        "ask_budget": int(state.get("ask_budget", DEFAULT_ASK_BUDGET)),
+        "plan_mode": bool(state.get("plan_mode", False)),
+        "pre_plan_approval_mode": state.get("pre_plan_approval_mode"),
+        "plan_feedback": state.get("plan_feedback"),
     }
 
-    tools = _build_planner_tools(working)
+    plan_mode = working["plan_mode"]
+    tools = _build_planner_tools(working, plan_mode=plan_mode, ask_budget_left=working["ask_budget"])
     tools_by_name = {tool.name: tool for tool in tools}
     agent = _model(state).bind_tools(tools)
 
     memory = build_layered_memory(working, node="planner")
     _emit_custom_event(memory_event(memory, node="planner"))
 
+    system_prompt = f"{PLANNER_PROMPT}\n{PLANNER_PLAN_MODE_PROMPT}" if plan_mode else PLANNER_PROMPT
     messages: list[BaseMessage] = [
-        SystemMessage(content=PLANNER_PROMPT),
+        SystemMessage(content=system_prompt),
         HumanMessage(content=_planner_input(working, memory)),
     ]
 
-    supervisor_summary = ""
+    # A rejected plan leaves feedback in state; surface it once, then clear it so
+    # it is not replayed on later planner entries.
+    plan_feedback = str(working.get("plan_feedback") or "").strip()
+    if plan_feedback:
+        messages.append(
+            HumanMessage(
+                content=f"Your plan was rejected with feedback: {plan_feedback}. Revise the plan."
+            )
+        )
+        working["plan_feedback"] = None
+
+    # Keep every non-empty assistant message, not just the last one: the planner
+    # often emits the substantive answer and then a short sign-off ("任务完成！"),
+    # and the verifier reads last_actor_summary as the delivered output. Taking
+    # only the final message would let a trailing pleasantry erase the answer.
+    supervisor_messages: list[str] = []
     for event in _react_events(agent, messages, tools_by_name, node="planner", max_loops=10):
         if event["type"] == "ai_message":
-            supervisor_summary = str(event["content"])
+            content = str(event["content"]).strip()
+            if content:
+                supervisor_messages.append(content)
+    supervisor_summary = "\n\n".join(supervisor_messages)
 
     return {
         "plan_summary": working["plan_summary"],
@@ -517,6 +576,10 @@ def planner_node(state: LinkiGraphState) -> dict:
         "code_agent_summary": working["code_agent_summary"],
         "messages": working["messages"],
         "last_actor_summary": working["code_agent_summary"] or supervisor_summary,
+        "ask_budget": working["ask_budget"],
+        "plan_mode": working["plan_mode"],
+        "pre_plan_approval_mode": working["pre_plan_approval_mode"],
+        "plan_feedback": working["plan_feedback"],
         "context_next_node": "verifier",
     }
 
@@ -797,20 +860,31 @@ def context_compressor_route(state: LinkiGraphState) -> str:
 
 
 def final_node(state: LinkiGraphState) -> dict:
-    """Format the final graph outcome."""
+    """Format the final graph outcome, leading with the model's actual answer.
 
-    status = "passed" if state.get("passed") else "failed"
+    The user-facing answer is the last substantive actor output; verification
+    status is appended as a compact footer rather than replacing the answer.
+    """
+
+    passed = bool(state.get("passed"))
     attempts = int(state.get("attempts", 0))
-    plan_summary = state.get("plan_summary", "")
-    last_error = state.get("last_error", "")
+    answer = str(state.get("last_actor_summary") or "").strip()
+    plan_summary = str(state.get("plan_summary") or "").strip()
+    last_error = str(state.get("last_error") or "").strip()
 
-    parts = [
-        f"Verification {status}.",
-        f"Attempts: {attempts}",
-    ]
-    if plan_summary:
-        parts.append(f"Plan: {plan_summary}")
-    if last_error and not state.get("passed"):
-        parts.append(f"Reason: {last_error}")
+    body_parts: list[str] = []
+    if answer:
+        body_parts.append(answer)
+    elif plan_summary:
+        body_parts.append(plan_summary)
 
-    return {"final_answer": "\n".join(parts)}
+    if not passed and last_error:
+        body_parts.append(f"⚠️ Not verified: {last_error}")
+
+    status = "passed" if passed else "failed"
+    footer = f"— Verification {status} · {attempts} attempt(s)"
+
+    body = "\n\n".join(body_parts)
+    final_answer = f"{body}\n\n{footer}" if body else footer
+
+    return {"final_answer": final_answer}

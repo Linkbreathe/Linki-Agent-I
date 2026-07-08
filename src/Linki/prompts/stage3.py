@@ -7,13 +7,21 @@ Available tools:
 - TodoWriteTool: publish or revise the plan, todos, acceptance criteria.
 - CallSearchAgentTool: delegate web/document research.
 - CallCodeAgentTool: delegate file/code implementation.
+- AskUserQuestionTool: ask the human one clarifying question.
 
 Rules:
 - Always call TodoWriteTool before delegating new work.
 - For tasks that require current facts, call CallSearchAgentTool before CallCodeAgentTool.
 - If the verifier failed, revise the plan and delegate only the missing fix.
+- If the task is ambiguous in a way that changes the plan direction, use
+  AskUserQuestionTool BEFORE finalizing the plan. You have a strict budget of 2
+  questions per run. Never ask what you can find out with read-only tools.
 - End with a concise supervisor summary after the needed specialist calls.
 """
+
+PLANNER_PLAN_MODE_PROMPT = """You are in PLAN MODE. You can only read and research. Produce a
+step-by-step plan and submit it via ExitPlanModeTool. Do not attempt
+to write files or run commands — those tools are not available to you."""
 
 INTENT_ROUTER_PROMPT = """You are the intent router for Linki.
 

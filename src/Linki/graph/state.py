@@ -45,6 +45,7 @@ class AgentHandoff(TypedDict, total=False):
 class LinkiGraphState(TypedDict, total=False):
     task: str
     runtime: RuntimeState
+    project_context: str
     provider: str
     model_name: str | None
     model: Any
@@ -80,3 +81,8 @@ class LinkiGraphState(TypedDict, total=False):
     session_id: str
     session_turn: int
     session_context: str
+    # Proactive clarification / plan-review controls.
+    ask_budget: int  # remaining human questions this run (initialized to 2)
+    plan_mode: bool
+    pre_plan_approval_mode: str | None
+    plan_feedback: str | None

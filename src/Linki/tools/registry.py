@@ -8,8 +8,23 @@ from Linki.tools.file_tools import FileEditTool, FileReadTool, FileWriteTool
 from Linki.tools.grep_tool import GrepTool
 
 
-def build_tools(state: RuntimeState) -> list[StructuredTool]:
-    """Build Linki tools for model.bind_tools()."""
+# Tools that mutate the workspace or run commands; withheld in plan mode.
+_MUTATING_TOOLS = {"FileWriteTool", "FileEditTool", "BashTool"}
+
+
+def build_tools(
+    state: RuntimeState,
+    *,
+    plan_mode: bool = False,
+    ask_budget_left: int | None = None,
+) -> list[StructuredTool]:
+    """Build Linki tools for model.bind_tools().
+
+    In plan mode the mutating tools (write/edit/bash) are filtered out so the
+    caller can only read and research. ``ask_budget_left`` is accepted for
+    interface parity with the planner's budget-gated tool filtering; the code
+    agent set has no question tool, so it currently gates nothing here.
+    """
 
     file_read = FileReadTool(state)
     file_write = FileWriteTool(state)
@@ -44,7 +59,7 @@ def build_tools(state: RuntimeState) -> list[StructuredTool]:
     def bash_tool(command: str, timeout_seconds: int = 30) -> str:
         return json.dumps(bash(command=command, timeout_seconds=timeout_seconds), ensure_ascii=False)
 
-    return [
+    tools = [
         StructuredTool.from_function(
             func=file_read_tool,
             name="FileReadTool",
@@ -71,6 +86,11 @@ def build_tools(state: RuntimeState) -> list[StructuredTool]:
             description="Run a bash command with the workspace as the working directory and a timeout.",
         ),
     ]
+
+    if plan_mode:
+        tools = [tool for tool in tools if tool.name not in _MUTATING_TOOLS]
+
+    return tools
 
 
 def build_read_only_tools(state: RuntimeState) -> list[StructuredTool]:

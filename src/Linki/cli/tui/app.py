@@ -6,15 +6,17 @@ from pathlib import Path
 from typing import Any
 
 from rich.text import Text
+from textual import events
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
-from textual.widgets import Collapsible, Footer, Header, Input, Static
+from textual.widgets import Collapsible, Footer, Header, Input, OptionList, Static
+from textual.widgets.option_list import Option
 
 from Linki.cli.tui.approval import ApprovalGate, ApprovalModal, ApprovalRequestedMessage
 from Linki.cli.tui.logo import animate_logo, build_logo
 from Linki.core.agent import _parse_graph_event, stream_session_events
-from Linki.core.approval import ApprovalDecision, ApprovalRequest
+from Linki.core.approval import KIND_PLAN, KIND_QUESTION, ApprovalDecision, ApprovalRequest
 from Linki.core.session import load_or_create_session, resolve_session_workspace
 
 # Rendering for each todo status: (icon, rich style).
@@ -25,6 +27,24 @@ TODO_RENDER = {
     "pending": ("○", "dim"),
 }
 PROGRESS_BAR_WIDTH = 18
+
+# Slash commands offered by the input autocomplete: (name, description).
+SLASH_COMMANDS: list[tuple[str, str]] = [
+    ("/plan", "Run this turn in plan mode"),
+    ("/resume", "Resume the latest checkpoint"),
+]
+
+
+def _matching_commands(value: str) -> list[tuple[str, str]]:
+    """Return slash commands matching the input while the command token is typed.
+
+    Suggestions are only offered before the first space (i.e. while the command
+    itself is being typed, not its arguments).
+    """
+
+    if not value.startswith("/") or " " in value:
+        return []
+    return [(name, desc) for name, desc in SLASH_COMMANDS if name.startswith(value)]
 
 
 class AgentEventMessage(Message):
@@ -109,7 +129,7 @@ class LinkiTuiApp(App[None]):
 
     #final {
         min-height: 4;
-        max-height: 10;
+        max-height: 16;
         margin-top: 1;
         border: round $success;
         border-title-color: $success;
@@ -121,6 +141,15 @@ class LinkiTuiApp(App[None]):
         height: 3;
         margin: 1 1 0 1;
         border: round $accent;
+    }
+
+    #cmd-menu {
+        height: auto;
+        max-height: 6;
+        margin: 0 1;
+        border: round $accent;
+        background: $panel;
+        display: none;
     }
 
     #approval-modal {
@@ -146,6 +175,23 @@ class LinkiTuiApp(App[None]):
         margin: 1 0;
     }
 
+    .approval-options {
+        height: auto;
+        margin: 1 0;
+    }
+
+    .approval-options Button {
+        width: 100%;
+        margin-bottom: 1;
+    }
+
+    .approval-plan {
+        height: 12;
+        border: solid $panel;
+        padding: 1;
+        margin: 1 0;
+    }
+
     .approval-buttons {
         height: 3;
     }
@@ -162,6 +208,7 @@ class LinkiTuiApp(App[None]):
         checkpoint_mode: str = "light",
         trace_mode: str = "on",
         initial_task: str | None = None,
+        plan_mode: bool = False,
     ) -> None:
         super().__init__()
         self.theme = "nord"
@@ -173,6 +220,7 @@ class LinkiTuiApp(App[None]):
         self.checkpoint_mode = checkpoint_mode
         self.trace_mode = trace_mode
         self.initial_task = initial_task
+        self.plan_mode = plan_mode
 
         self._turn_thread: threading.Thread | None = None
         self._running_turn = False
@@ -194,14 +242,17 @@ class LinkiTuiApp(App[None]):
                 yield Static("", id="session")
             with Vertical(id="stream-col"):
                 yield VerticalScroll(id="events")
-                yield Static("Final answer will appear here.", id="final")
+                with VerticalScroll(id="final"):
+                    yield Static("Final answer will appear here.", id="final-body")
         yield Input(placeholder="Type a message for Linki", id="input")
+        yield OptionList(id="cmd-menu")
         yield Footer()
 
     async def on_mount(self) -> None:
         self.query_one("#plan-wrap", VerticalScroll).border_title = "◐ Plan"
         self.query_one("#events", VerticalScroll).border_title = "▸ Activity"
-        self.query_one("#final", Static).border_title = "✦ Final answer"
+        self.query_one("#final", VerticalScroll).border_title = "✦ Final answer"
+        self.query_one("#cmd-menu", OptionList).display = False
 
         session = load_or_create_session(self.workspace)
         self._session_id = str(session.get("session_id", ""))
@@ -223,23 +274,135 @@ class LinkiTuiApp(App[None]):
             gate.resolve(approved=False, reason="TUI closed")
         self.exit()
 
+    # --- Slash-command autocomplete ------------------------------------------
+
+    def _cmd_menu(self) -> OptionList:
+        return self.query_one("#cmd-menu", OptionList)
+
+    def _cmd_menu_visible(self) -> bool:
+        try:
+            return bool(self._cmd_menu().display)
+        except Exception:
+            return False
+
+    def _hide_cmd_menu(self) -> None:
+        self._cmd_menu().display = False
+
+    def _fill_command(self, name: str) -> None:
+        """Complete the input with a command name and keep typing arguments."""
+
+        input_widget = self.query_one("#input", Input)
+        input_widget.value = f"{name} "
+        input_widget.cursor_position = len(input_widget.value)
+        self._hide_cmd_menu()
+        input_widget.focus()
+
+    def _accept_highlighted_command(self) -> None:
+        menu = self._cmd_menu()
+        index = menu.highlighted
+        if index is None:
+            self._hide_cmd_menu()
+            return
+        option = menu.get_option_at_index(index)
+        self._fill_command(option.id or str(option.prompt))
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id != "input":
+            return
+        matches = _matching_commands(event.value)
+        menu = self._cmd_menu()
+        if not matches:
+            menu.display = False
+            return
+        menu.clear_options()
+        menu.add_options([Option(f"{name}   {desc}", id=name) for name, desc in matches])
+        menu.highlighted = 0
+        menu.display = True
+
+    def on_key(self, event: events.Key) -> None:
+        # Only intercept navigation while the suggestion menu is open; Enter is
+        # handled in on_input_submitted so it can also start a turn.
+        if not self._cmd_menu_visible():
+            return
+        menu = self._cmd_menu()
+        if event.key == "down":
+            menu.action_cursor_down()
+            event.stop()
+            event.prevent_default()
+        elif event.key == "up":
+            menu.action_cursor_up()
+            event.stop()
+            event.prevent_default()
+        elif event.key == "tab":
+            self._accept_highlighted_command()
+            event.stop()
+            event.prevent_default()
+        elif event.key == "escape":
+            self._hide_cmd_menu()
+            event.stop()
+            event.prevent_default()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option_list.id != "cmd-menu":
+            return
+        self._fill_command(event.option.id or str(event.option.prompt))
+
     def on_input_submitted(self, event: Input.Submitted) -> None:
+        # Enter while the menu is open accepts the highlighted command instead of
+        # submitting a turn.
+        if self._cmd_menu_visible():
+            self._accept_highlighted_command()
+            return
+
         value = event.value.strip()
         if not value or self._running_turn:
             return
         self.query_one("#input", Input).value = ""
-        self._start_turn(value)
+
+        plan_mode = self.plan_mode
+        if value == "/plan" or value.startswith("/plan "):
+            plan_mode = True
+            value = value[len("/plan"):].strip()
+            if not value:
+                self._write_event("📝 Plan mode armed — type your task and press Enter.", kind="system")
+                return
+        elif value == "/resume" or value.startswith("/resume"):
+            self._write_event(
+                "ℹ️ /resume is a startup flag — restart with: linki --resume <workspace>",
+                kind="system",
+            )
+            return
+
+        self._start_turn(value, plan_mode=plan_mode)
 
     def on_agent_event_message(self, message: AgentEventMessage) -> None:
         self._handle_event(message.event)
 
     def on_approval_requested_message(self, message: ApprovalRequestedMessage) -> None:
-        def resolve(result: bool | None) -> None:
-            approved = bool(result)
-            message.gate.resolve(
-                approved=approved,
-                reason="approved via TUI" if approved else "denied via TUI",
-            )
+        kind = message.gate.request.kind
+
+        def resolve(result: Any) -> None:
+            if kind == KIND_QUESTION:
+                answer = str(result or "")
+                message.gate.resolve(
+                    approved=True,
+                    reason="answered via TUI" if answer else "skipped via TUI",
+                    answer=answer,
+                )
+            elif kind == KIND_PLAN:
+                data = result if isinstance(result, dict) else {}
+                approved = bool(data.get("approved"))
+                message.gate.resolve(
+                    approved=approved,
+                    reason="plan approved via TUI" if approved else "plan rejected via TUI",
+                    answer=str(data.get("feedback") or ""),
+                )
+            else:
+                approved = bool(result)
+                message.gate.resolve(
+                    approved=approved,
+                    reason="approved via TUI" if approved else "denied via TUI",
+                )
             if message.gate in self._pending_gates:
                 self._pending_gates.remove(message.gate)
 
@@ -377,19 +540,21 @@ class LinkiTuiApp(App[None]):
         except TypeError:
             return str(detail)
 
-    def _start_turn(self, task: str) -> None:
+    def _start_turn(self, task: str, plan_mode: bool | None = None) -> None:
         if self._running_turn:
             return
+        turn_plan_mode = self.plan_mode if plan_mode is None else plan_mode
         self._running_turn = True
         self.query_one("#input", Input).disabled = True
-        self.query_one("#final", Static).update("Running...")
-        self._write_event(f"💬 User: {task}", detail={"task": task}, kind="user")
+        self.query_one("#final-body", Static).update("Running...")
+        label = f"💬 User: {task}" + ("  · plan mode" if turn_plan_mode else "")
+        self._write_event(label, detail={"task": task, "plan_mode": turn_plan_mode}, kind="user")
         self._set_state("running")
         self._set_status(f"running | workspace: {self.workspace}")
 
         self._turn_thread = threading.Thread(
             target=self._run_turn,
-            args=(task,),
+            args=(task, turn_plan_mode),
             daemon=True,
         )
         self._turn_thread.start()
@@ -412,7 +577,7 @@ class LinkiTuiApp(App[None]):
             gate.resolve(approved=False, reason="TUI closed")
         return gate.wait()
 
-    def _run_turn(self, task: str) -> None:
+    def _run_turn(self, task: str, plan_mode: bool = False) -> None:
         try:
             for event in stream_session_events(
                 task,
@@ -424,6 +589,7 @@ class LinkiTuiApp(App[None]):
                 trace_mode=self.trace_mode,
                 provider=self.provider,
                 model_name=self.model_name,
+                plan_mode=plan_mode,
             ):
                 self._post_agent_event(event)
         except Exception as exc:
@@ -495,7 +661,7 @@ class LinkiTuiApp(App[None]):
             self._write_event(
                 f"⏸ Interrupted — resume with: {event.get('resume_command', '')}", detail=event, kind="error"
             )
-            self.query_one("#final", Static).update("Run interrupted. Resume from the last checkpoint.")
+            self.query_one("#final-body", Static).update("Run interrupted. Resume from the last checkpoint.")
             return
 
         if event_type == "handoff":
@@ -528,12 +694,12 @@ class LinkiTuiApp(App[None]):
             route = event.get("route")
             prefix = f"💬 Final answer ({route})" if route else "💬 Final answer"
             self._write_event(prefix, detail=event, kind="success")
-            self.query_one("#final", Static).update(content or "No final answer.")
+            self.query_one("#final-body", Static).update(content or "No final answer.")
             return
 
         if event_type == "error":
             self._write_event(f"❌ {event.get('error_type')}: {event.get('error')}", detail=event, kind="error")
-            self.query_one("#final", Static).update(str(event.get("error") or "Error"))
+            self.query_one("#final-body", Static).update(str(event.get("error") or "Error"))
             return
 
         if event_type == "turn_finished":
@@ -578,7 +744,7 @@ class LinkiTuiApp(App[None]):
 
         if node == "final":
             content = str(data.get("final_answer") or "")
-            self.query_one("#final", Static).update(content)
+            self.query_one("#final-body", Static).update(content)
             return
 
     @staticmethod

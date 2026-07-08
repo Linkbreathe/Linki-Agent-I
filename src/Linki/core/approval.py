@@ -60,28 +60,75 @@ def classify_command_risk(command: str) -> str | None:
     return None
 
 
+# Approval channel "kinds". The command path is the original BashTool flow; the
+# question/plan kinds reuse the same handler/gate plumbing for proactive
+# clarification and plan review.
+KIND_COMMAND = "command"
+KIND_QUESTION = "question"
+KIND_PLAN = "plan"
+
+
 @dataclass(frozen=True)
 class ApprovalRequest:
     id: str
-    command: str
-    risk_reason: str
+    command: str = ""
+    risk_reason: str = ""
     tool_name: str = "BashTool"
+    kind: str = KIND_COMMAND
+    # Populated for kind == "question".
+    question: str = ""
+    options: tuple[str, ...] = ()
+    allow_free_text: bool = True
+    # Populated for kind == "plan".
+    plan_text: str = ""
 
 
 @dataclass(frozen=True)
 class ApprovalDecision:
     approved: bool
     reason: str = ""
+    # Free-text answer for question kind, or reviewer feedback for plan kind.
+    answer: str = ""
 
 
 def new_approval_request(command: str, risk_reason: str, *, tool_name: str = "BashTool") -> ApprovalRequest:
-    """Build an ApprovalRequest with a freshly generated request id."""
+    """Build a command ApprovalRequest with a freshly generated request id."""
 
     return ApprovalRequest(
         id=f"approval-{uuid4().hex[:8]}",
         command=command,
         risk_reason=risk_reason,
         tool_name=tool_name,
+        kind=KIND_COMMAND,
+    )
+
+
+def new_question_request(
+    question: str,
+    options: list[str] | tuple[str, ...] | None = None,
+    *,
+    allow_free_text: bool = True,
+) -> ApprovalRequest:
+    """Build a clarifying-question request routed through the approval channel."""
+
+    return ApprovalRequest(
+        id=f"question-{uuid4().hex[:8]}",
+        tool_name="AskUserQuestionTool",
+        kind=KIND_QUESTION,
+        question=question,
+        options=tuple(options or ()),
+        allow_free_text=allow_free_text,
+    )
+
+
+def new_plan_request(plan_text: str) -> ApprovalRequest:
+    """Build a plan-review request routed through the approval channel."""
+
+    return ApprovalRequest(
+        id=f"plan-{uuid4().hex[:8]}",
+        tool_name="PlanReview",
+        kind=KIND_PLAN,
+        plan_text=plan_text,
     )
 
 

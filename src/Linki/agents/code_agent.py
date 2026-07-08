@@ -130,7 +130,13 @@ def _session_context(state: Any) -> str:
 
 def _code_agent_input(state: Any, instruction: str, memory: LayeredMemory) -> str:
     values = state if isinstance(state, Mapping) else {}
-    parts = [
+    parts: list[str] = []
+
+    project_context = str(values.get("project_context") or "").strip()
+    if project_context:
+        parts.append(project_context)
+
+    parts += [
         f"Task:\n{values.get('task', '')}",
         f"Instruction:\n{instruction}",
         f"Session context:\n{_session_context(state)}",
@@ -190,10 +196,15 @@ def run_code_agent(
     """
 
     runtime = _runtime(state)
-    tools = build_tools(runtime)
+    values = state if isinstance(state, Mapping) else {}
+    # Defense-in-depth: even if reached in plan mode, keep the code agent read-only.
+    tools = build_tools(
+        runtime,
+        plan_mode=bool(values.get("plan_mode")),
+        ask_budget_left=values.get("ask_budget"),
+    )
     tools_by_name = {tool.name: tool for tool in tools}
 
-    values = state if isinstance(state, Mapping) else {}
     todos = [_todo_dict(todo, index) for index, todo in enumerate(values.get("todos") or [])]
 
     agent = _model(state).bind_tools(tools + [TodoUpdateTool])

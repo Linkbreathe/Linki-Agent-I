@@ -9,7 +9,7 @@ from rich.syntax import Syntax
 from rich.table import Table
 import typer
 
-from Linki.core.approval import ApprovalDecision, ApprovalRequest
+from Linki.core.approval import KIND_PLAN, KIND_QUESTION, ApprovalDecision, ApprovalRequest
 from Linki.core.agent import _parse_graph_event, stream_agent_events, stream_session_events
 from Linki.core.session import create_run_workspace
 
@@ -273,7 +273,40 @@ def _checks_table(checks: list[dict]) -> Table:
     return table
 
 
+def _cli_question_handler(request: ApprovalRequest) -> ApprovalDecision:
+    renderable: Any = request.question
+    if request.options:
+        options_text = "\n".join(f"  {index}. {option}" for index, option in enumerate(request.options, start=1))
+        renderable = Group(request.question, "", options_text)
+    console.print(Panel(renderable, title="❓ Clarifying question", border_style="cyan"))
+
+    answer = typer.prompt("Your answer", default="").strip()
+    # A bare option number resolves to that option's text.
+    if request.options and answer.isdigit():
+        index = int(answer) - 1
+        if 0 <= index < len(request.options):
+            answer = request.options[index]
+
+    return ApprovalDecision(approved=True, reason="answered via CLI", answer=answer)
+
+
+def _cli_plan_handler(request: ApprovalRequest) -> ApprovalDecision:
+    console.print(Panel(request.plan_text or "—", title="📋 Plan review", border_style="blue"))
+    approved = typer.confirm("Approve this plan?", default=True)
+    feedback = "" if approved else typer.prompt("Feedback for revision", default="").strip()
+    return ApprovalDecision(
+        approved=approved,
+        reason="plan approved via CLI" if approved else "plan rejected via CLI",
+        answer=feedback,
+    )
+
+
 def _cli_approval_handler(request: ApprovalRequest) -> ApprovalDecision:
+    if request.kind == KIND_QUESTION:
+        return _cli_question_handler(request)
+    if request.kind == KIND_PLAN:
+        return _cli_plan_handler(request)
+
     approved = typer.confirm(
         f"{request.tool_name} requires approval: {request.risk_reason}\nCommand: {request.command}",
         default=False,
@@ -599,6 +632,13 @@ def main(
             help="Resume a workspace from its latest Linki checkpoint.",
         ),
     ] = None,
+    plan: Annotated[
+        bool,
+        typer.Option(
+            "--plan",
+            help="Start in plan mode: read/research and submit a plan for approval before executing.",
+        ),
+    ] = False,
     verbose: Annotated[
         bool,
         typer.Option(
@@ -641,6 +681,7 @@ def main(
             checkpoint_mode=checkpoint_mode,
             trace_mode=trace_mode,
             initial_task=task,
+            plan_mode=plan,
         ).run()
         return
 
@@ -664,6 +705,7 @@ def main(
                 trace_mode=trace_mode,
                 provider=provider_name,
                 model_name=model,
+                plan_mode=plan,
             )
             if resume is not None
             else stream_session_events(
@@ -676,6 +718,7 @@ def main(
                 trace_mode=trace_mode,
                 provider=provider_name,
                 model_name=model,
+                plan_mode=plan,
             )
         )
         for event in event_stream:

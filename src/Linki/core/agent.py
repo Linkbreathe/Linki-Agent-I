@@ -6,6 +6,7 @@ from typing import Any
 from langchain_core.messages import BaseMessage
 
 from Linki.core.checkpoint import CheckpointManager, resume_command
+from Linki.core.context import assemble_project_context
 from Linki.core.paths import ensure_workspace
 from Linki.core.session import (
     append_assistant_turn,
@@ -211,6 +212,7 @@ def stream_agent_events(
     session_id: str = "",
     session_turn: int = 0,
     session_context: str = "",
+    plan_mode: bool = False,
 ) -> Iterator[dict]:
     """Stream graph/custom events while recording checkpoints and traces."""
 
@@ -224,6 +226,10 @@ def stream_agent_events(
     )
     ensure_workspace(runtime, create=True)
 
+    # Assemble the workspace's project context once per run; planner/codeAgent
+    # prompt builders inject it from graph state.
+    project_context = assemble_project_context(runtime)
+
     manager = CheckpointManager(runtime, task=task)
     trace = TraceRecorder(runtime, task=task)
 
@@ -231,6 +237,7 @@ def stream_agent_events(
     current_state: dict[str, Any] = {
         "task": task,
         "runtime": runtime,
+        "project_context": project_context,
         "attempts": 0,
         "max_attempts": max_attempts,
         "provider": provider,
@@ -253,6 +260,11 @@ def stream_agent_events(
             manager.task = restored_task
             trace.task = restored_task
             inputs["runtime"] = runtime
+            inputs["project_context"] = project_context
+            inputs.setdefault("ask_budget", 2)
+            if plan_mode:
+                inputs["plan_mode"] = True
+                inputs.setdefault("pre_plan_approval_mode", approval_mode)
             inputs["provider"] = provider
             inputs["model_name"] = model_name
             inputs["model"] = model or create_model(provider=provider, model=model_name)
@@ -263,6 +275,10 @@ def stream_agent_events(
             inputs = {
                 "task": task,
                 "runtime": runtime,
+                "project_context": project_context,
+                "ask_budget": 2,
+                "plan_mode": plan_mode,
+                "pre_plan_approval_mode": approval_mode if plan_mode else None,
                 "attempts": 0,
                 "max_attempts": max_attempts,
                 "provider": provider,
@@ -422,6 +438,7 @@ def stream_session_events(
     approval_handler: Callable[[Any], Any] | None = None,
     checkpoint_mode: str = "light",
     trace_mode: str = "on",
+    plan_mode: bool = False,
     **kwargs: Any,
 ) -> Iterator[dict]:
     """
@@ -548,6 +565,7 @@ def stream_session_events(
             session_id=session["session_id"],
             session_turn=turn,
             session_context=session_context,
+            plan_mode=plan_mode,
         ):
             if event.get("type") == "graph_event":
                 inner = event.get("event")
