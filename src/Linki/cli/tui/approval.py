@@ -4,6 +4,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.message import Message
@@ -91,13 +92,20 @@ class ApprovalModal(ModalScreen[object]):
             yield from self._compose_command()
 
     def _compose_command(self) -> ComposeResult:
+        title = "Approval Required"
+        if self.request.label:
+            # e.g. "[job-2 · reviewer] Approval Required" for a parallel dispatch job.
+            title = f"{self.request.label} {title}"
+        # markup=False: the command, risk reason, and job label are untrusted text
+        # (they routinely contain [] " and regex/char-classes). Parsing them as
+        # Textual markup would raise MarkupError and crash the whole TUI.
         yield Container(
             Vertical(
-                Static("Approval Required", classes="approval-title"),
-                Static(f"Tool: {self.request.tool_name}"),
-                Static(f"Risk reason: {self.request.risk_reason}"),
-                Static(f"Workspace: {self.workspace}"),
-                Static(self.request.command, classes="approval-command"),
+                Static(title, classes="approval-title", markup=False),
+                Static(f"Tool: {self.request.tool_name}", markup=False),
+                Static(f"Risk reason: {self.request.risk_reason}", markup=False),
+                Static(f"Workspace: {self.workspace}", markup=False),
+                Static(self.request.command, classes="approval-command", markup=False),
                 Horizontal(
                     Button("Approve", variant="success", id="approve"),
                     Button("Deny", variant="error", id="deny"),
@@ -109,13 +117,15 @@ class ApprovalModal(ModalScreen[object]):
         )
 
     def _compose_question(self) -> ComposeResult:
+        # Text() labels / markup=False keep untrusted option and question text
+        # from being parsed as Textual markup (which would crash the modal).
         option_buttons = [
-            Button(option, variant="primary", id=f"opt-{index}")
+            Button(Text(option), variant="primary", id=f"opt-{index}")
             for index, option in enumerate(self.request.options)
         ]
         children: list[Any] = [
             Static("Clarifying Question", classes="approval-title"),
-            Static(self.request.question, classes="approval-command"),
+            Static(self.request.question, classes="approval-command", markup=False),
         ]
         if option_buttons:
             children.append(Vertical(*option_buttons, classes="approval-options"))
@@ -139,7 +149,7 @@ class ApprovalModal(ModalScreen[object]):
             Vertical(
                 Static("Plan Review", classes="approval-title"),
                 VerticalScroll(
-                    Static(self.request.plan_text or "—"),
+                    Static(self.request.plan_text or "—", markup=False),
                     classes="approval-plan",
                 ),
                 Input(placeholder="Feedback (required to reject)…", id="feedback"),

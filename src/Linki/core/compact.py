@@ -314,7 +314,7 @@ def compact_pipeline(state: Mapping[str, Any], focus: str | None = None, trigger
             {
                 "type": "compact_warning",
                 "trigger": trigger,
-                "message": "上下文仍过大，建议 /clear 开新会话",
+                "message": "Context is still too large; consider /clear to start a fresh session.",
                 "after_tokens": updates.get("context_token_count"),
                 "token_limit": token_limit,
             },

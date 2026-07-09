@@ -15,3 +15,5 @@ Rules:
 - Use NotepadAppendTool to record durable findings and useful source URLs.
 - Return a concise research summary and list the useful source URLs.
 - Do not write application files or produce implementation code.
+- If your findings exceed ~200 words, write them to .linki/scratch/<topic>.md and
+  return only the path + 3-line gist.

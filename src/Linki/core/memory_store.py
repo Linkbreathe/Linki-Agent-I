@@ -280,7 +280,7 @@ def upsert_agent_memory(
             return {"status": "skipped", "index": replaces, "text": text.strip(), "reason": reason}
         entries[replaces - 1] = MemoryEntry(date=_today(), source="agent", run_id=run_id, text=text.strip())
         _write(state, entries, added=0)
-        _emit(state, {"type": "memory_agent_upsert", "action": "replaced", "index": replaces, "run_id": run_id})
+        _emit(state, {"type": "memory_agent_upsert", "action": "replaced", "index": replaces, "run_id": run_id, "text": text.strip()})
         return {"status": "replaced", "index": replaces, "text": text.strip()}
 
     for index, entry in enumerate(entries, start=1):
@@ -298,7 +298,7 @@ def upsert_agent_memory(
     entries.append(entry)
     _write(state, entries, added=1)
     index = len(entries)
-    _emit(state, {"type": "memory_agent_upsert", "action": "added", "index": index, "run_id": run_id})
+    _emit(state, {"type": "memory_agent_upsert", "action": "added", "index": index, "run_id": run_id, "text": text.strip()})
     return {"status": "added", "index": index, "text": text.strip()}
 
 

@@ -29,7 +29,7 @@ def test_hash_memory_write_echoes(tmp_path: Path) -> None:
             await pilot.press("enter")
             await pilot.pause()
 
-            assert any("已写入记忆" in event for event in events)
+            assert any("Saved to memory" in event for event in events)
             assert existing_entries(create_runtime(tmp_path))[0].text == "Prefer short answers"
 
     asyncio.run(impl())

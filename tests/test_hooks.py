@@ -135,14 +135,14 @@ def test_agent_cannot_write_hooks_config(tmp_path: Path) -> None:
     )
 
     assert result["ok"] is False
-    assert result["error"] == "protected path: 策略文件对 Agent 只读"
+    assert result["error"] == "protected path: policy files are read-only to the agent"
     assert not (tmp_path / ".linki" / "hooks.json").exists()
 
     script_result = _tools(runtime)["FileWriteTool"].invoke(
         {"file_path": ".linki/hooks/new_policy.py", "content": "print('x')"}
     )
     assert script_result["ok"] is False
-    assert script_result["error"] == "protected path: 策略文件对 Agent 只读"
+    assert script_result["error"] == "protected path: policy files are read-only to the agent"
     assert not (tmp_path / ".linki" / "hooks" / "new_policy.py").exists()
 
 

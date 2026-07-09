@@ -10,6 +10,7 @@ from rich.table import Table
 from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
+from textual.markup import escape as escape_markup
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.widgets import Collapsible, Footer, Header, Input, OptionList, Static
@@ -123,27 +124,32 @@ class LinkiTuiApp(App[None]):
 
     #events {
         height: 1fr;
-        border: round $panel;
+        border: round $accent;
         border-title-color: $accent;
         border-title-style: bold;
         padding: 0 1;
     }
 
+    /* Every event row carries a coloured left "spine" so its kind reads at a
+       glance and the whole stream shares one consistent visual rhythm. */
     #events Collapsible {
         padding-bottom: 0;
+        margin-bottom: 1;
         background: transparent;
+        border-left: solid $panel;
     }
 
-    #events Collapsible.evt-user { background: $primary 25%; }
-    #events Collapsible.evt-agent { background: $accent 18%; }
-    #events Collapsible.evt-tool { background: $boost; }
-    #events Collapsible.evt-plan { background: $warning 15%; }
-    #events Collapsible.evt-success { background: $success 20%; }
-    #events Collapsible.evt-error { background: $error 25%; }
-    #events Collapsible.evt-handoff { background: $secondary 22%; }
-    #events Collapsible.evt-subagent { background: $secondary 14%; border-left: solid $secondary; }
+    #events Collapsible.evt-user { background: $primary 20%; border-left: solid $primary; }
+    #events Collapsible.evt-agent { background: $accent 15%; border-left: solid $accent; }
+    #events Collapsible.evt-tool { background: $boost; border-left: solid $panel; }
+    #events Collapsible.evt-plan { background: $warning 15%; border-left: solid $warning; }
+    #events Collapsible.evt-success { background: $success 18%; border-left: solid $success; }
+    #events Collapsible.evt-error { background: $error 22%; border-left: solid $error; }
+    #events Collapsible.evt-handoff { background: $secondary 18%; border-left: solid $secondary; }
+    #events Collapsible.evt-subagent { background: $secondary 12%; border-left: solid $secondary; }
     #events Collapsible.evt-hook { background: $warning 10%; border-left: solid $warning; }
-    #events Collapsible.evt-system { background: $foreground 5%; }
+    #events Collapsible.evt-memory { background: $boost; border-left: solid #b48ead; }
+    #events Collapsible.evt-system { background: $foreground 5%; border-left: solid $panel; }
 
     #final {
         min-height: 4;
@@ -392,7 +398,7 @@ class LinkiTuiApp(App[None]):
             if text:
                 runtime = create_runtime(self.workspace)
                 append_user_memory(runtime, text)
-                self._write_event(f"✏️ 已写入记忆（user）：{text}", kind="system")
+                self._write_event(f"✏️ Saved to memory (user): {text}", kind="system")
             return
 
         if value.startswith("/"):
@@ -436,7 +442,7 @@ class LinkiTuiApp(App[None]):
             except (ValueError, IndexError) as exc:
                 self._write_event(f"❌ Memory remove failed: {exc}", kind="error")
                 return True
-            self._write_event(f"🧠 记忆已删除，剩余 {remaining} 条", kind="system")
+            self._write_event(f"🧠 Memory deleted · {remaining} remaining", kind="system")
             return True
 
         return False
@@ -444,7 +450,7 @@ class LinkiTuiApp(App[None]):
     def _show_memory(self) -> None:
         entries = existing_entries(create_runtime(self.workspace))
         if not entries:
-            self._write_event("🧠 记忆为空", kind="system")
+            self._write_event("🧠 Memory is empty", kind="system")
             return
         table = Table(show_header=True, header_style="bold")
         table.add_column("#", justify="right", no_wrap=True)
@@ -454,7 +460,7 @@ class LinkiTuiApp(App[None]):
         for index, entry in enumerate(entries, start=1):
             source = entry.source if entry.source == "user" or not entry.run_id else f"{entry.source}@{entry.run_id}"
             table.add_row(str(index), entry.date, source, entry.text)
-        self._write_event("🧠 记忆", detail=table, kind="system")
+        self._write_event("🧠 Memory", detail=table, kind="system")
 
     def _run_manual_compact(self, focus: str | None) -> None:
         events: list[dict[str, Any]] = []
@@ -538,8 +544,8 @@ class LinkiTuiApp(App[None]):
             line.append(f" · turn {self._turn_index}", style="dim")
         line.append("\n")
         short_id = self._session_id[:8] if self._session_id else "—"
-        line.append(f"session {short_id} · ", style="dim")
-        line.append(f"{self.workspace.name}\n", style="dim italic")
+        line.append(f"session {short_id}\n", style="dim")
+        line.append(f"run {self.workspace.name}\n", style="dim italic")
         line.append(f"{self.provider} · {self.model_name or 'default model'}\n", style="dim")
         if self._active_agent:
             line.append("🤖 ", style="bold")
@@ -603,7 +609,10 @@ class LinkiTuiApp(App[None]):
             renderable = Text(body)
         collapsible = Collapsible(
             Static(renderable),
-            title=summary,
+            # Summaries embed untrusted text (bash commands, regex char-classes,
+            # file paths) that would otherwise be parsed as Textual markup and
+            # crash the stream with MarkupError. Escape so it renders literally.
+            title=escape_markup(summary),
             collapsed=True,
             classes=f"evt-{kind}",
         )
@@ -698,6 +707,8 @@ class LinkiTuiApp(App[None]):
         text.append("▓" * filled, style=bar_style)
         text.append("░" * (PROGRESS_BAR_WIDTH - filled), style="dim")
         text.append(f"  {done}/{total}\n", style="bold" if total else "dim")
+        # Breathing room between the progress bar and the plan body.
+        text.append("\n")
 
         if self._plan_summary:
             text.append(f"{self._plan_summary}\n", style="italic dim")
@@ -940,11 +951,29 @@ class LinkiTuiApp(App[None]):
             )
             return
 
+        if event_type == "memory_agent_upsert":
+            action = str(event.get("action") or "")
+            prefix = self._subagent_prefix(event)
+            text = self._truncate(str(event.get("text") or ""), 80)
+            if action == "added":
+                self._write_event(
+                    f"{prefix}🧠 Memory +1 (#{event.get('index')}): {text}", detail=event, kind="memory"
+                )
+            elif action == "replaced":
+                self._write_event(
+                    f"{prefix}🧠 Memory updated #{event.get('index')}: {text}", detail=event, kind="memory"
+                )
+            else:  # skipped — quieter, it did NOT change the store
+                self._write_event(
+                    f"{prefix}🧠 Memory skipped: {event.get('reason')}", detail=event, kind="system"
+                )
+            return
+
         if event_type == "memory_extract":
             added = int(event.get("added") or 0)
             replaced = int(event.get("replaced") or 0)
             if added or replaced:
-                self._write_event(f"🧠 记忆提取：新增 {added} 条 / 覆盖 {replaced} 条", detail=event, kind="system")
+                self._write_event(f"🧠 Memory extracted: {added} added / {replaced} updated", detail=event, kind="system")
             return
 
         if event_type == "checkpoint_saved":

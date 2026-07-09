@@ -18,6 +18,10 @@ AGENT_TOOL_NAME = "AgentTool"
 # AgentTool it IS available to subagents that whitelist it in their definition.
 SKILL_TOOL_NAME = "SkillTool"
 
+# AgentDispatchTool dispatches several subagents in parallel. Like AgentTool it
+# is planner-only and never handed to a subagent (no nested parallel dispatch).
+AGENT_DISPATCH_TOOL_NAME = "AgentDispatchTool"
+
 # Every tool name an agent definition may reference. Agent definitions are
 # validated against this set at registry-load time so an unknown tool aborts
 # startup instead of failing silently at dispatch.

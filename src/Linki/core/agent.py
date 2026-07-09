@@ -9,7 +9,7 @@ from Linki.core.checkpoint import CheckpointManager, resume_command
 from Linki.core.context import assemble_project_context
 from Linki.core.hooks import load_hooks_config
 from Linki.core.memory_store import extract_run_memories
-from Linki.core.paths import ensure_workspace
+from Linki.core.paths import ensure_scratch_dir, ensure_workspace
 from Linki.core.session import (
     append_assistant_turn,
     append_user_turn,
@@ -228,6 +228,7 @@ def stream_agent_events(
         trace_mode=trace_mode,
     )
     ensure_workspace(runtime, create=True)
+    ensure_scratch_dir(runtime)
     load_hooks_config(runtime)
     # Populate the run's skill catalog and clear any prior run's disclosures.
     load_skills_into_runtime(runtime)

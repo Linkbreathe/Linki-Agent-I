@@ -1,5 +1,5 @@
-from Linki.cli.app import app
+from Linki.cli.app import run
 
 
 if __name__ == "__main__":
-    app()
+    run()

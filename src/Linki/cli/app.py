@@ -554,14 +554,35 @@ def _print_event(event: dict, *, verbose: bool = False) -> None:
         )
         return
 
+    if event_type == "memory_agent_upsert":
+        action = str(event.get("action") or "")
+        if action == "skipped":
+            console.print(
+                Panel(
+                    str(event.get("reason") or ""),
+                    title=_subagent_title(event, "🧠 Memory skipped"),
+                    border_style="yellow",
+                )
+            )
+            return
+        verb = "+1" if action == "added" else f"updated #{event.get('index')}"
+        console.print(
+            Panel(
+                str(event.get("text") or ""),
+                title=_subagent_title(event, f"🧠 Memory {verb}"),
+                border_style="magenta",
+            )
+        )
+        return
+
     if event_type == "memory_extract":
         added = int(event.get("added") or 0)
         replaced = int(event.get("replaced") or 0)
         if added or replaced:
             console.print(
                 Panel(
-                    f"新增 {added} 条 / 覆盖 {replaced} 条\nTotal: {event.get('total', 0)}",
-                    title="🧠 记忆提取",
+                    f"{added} added / {replaced} updated\nTotal: {event.get('total', 0)}",
+                    title="🧠 Memory extracted",
                     border_style="blue",
                 )
             )
@@ -857,3 +878,104 @@ def main(
     except ValueError as exc:
         typer.secho(str(exc), err=True, fg=typer.colors.RED)
         raise typer.Exit(code=1) from exc
+
+
+# The swarm lab lives on its own single-command app. `run()` dispatches
+# `linki swarm …` here after stripping the "swarm" token, which sidesteps the
+# Click ambiguity between the default task command and a named subcommand.
+swarm_app = typer.Typer(no_args_is_help=True)
+
+
+@swarm_app.command("swarm")
+def swarm(
+    task: Annotated[str, typer.Argument(help="Task for the swarm to decompose and run.")],
+    team: Annotated[
+        str,
+        typer.Option("--team", help="Team name; namespaces the board and mailboxes."),
+    ],
+    agents: Annotated[
+        str,
+        typer.Option("--agents", help="Comma-separated registered agent names, e.g. a,b,c."),
+    ],
+    experimental_swarm: Annotated[
+        bool,
+        typer.Option(
+            "--experimental-swarm",
+            help="Required. Acknowledges the swarm lab is an experimental capability.",
+        ),
+    ] = False,
+    workspace: Annotated[
+        Path | None,
+        typer.Option("--workspace", "-w", help="Base directory for the run folder."),
+    ] = None,
+    max_rounds: Annotated[
+        int,
+        typer.Option("--max-rounds", help="Maximum scheduler rounds before stopping."),
+    ] = 8,
+    provider: Annotated[
+        str,
+        typer.Option("--provider", "-p", help="Model provider: openai or deepseek."),
+    ] = "openai",
+    model: Annotated[
+        str | None,
+        typer.Option("--model", "-m", help="Override the provider default model."),
+    ] = None,
+) -> None:
+    """Run the experimental turn-based multi-agent swarm lab."""
+
+    if not experimental_swarm:
+        typer.secho(
+            "The swarm lab is an experimental capability. Re-run with "
+            "--experimental-swarm to enable it.",
+            err=True,
+            fg=typer.colors.RED,
+        )
+        raise typer.Exit(code=2)
+
+    provider_name = provider.lower()
+    if provider_name not in {"openai", "deepseek"}:
+        raise typer.BadParameter("provider must be 'openai' or 'deepseek'")
+
+    agent_names = [name.strip() for name in agents.split(",") if name.strip()]
+    if not agent_names:
+        raise typer.BadParameter("--agents must list at least one agent name")
+
+    from Linki.core.paths import ensure_scratch_dir, ensure_workspace
+    from Linki.core.state import create_runtime
+    from Linki.swarm.scheduler import run_swarm
+
+    active_workspace = create_run_workspace(workspace)
+    runtime = create_runtime(active_workspace)
+    ensure_workspace(runtime, create=True)
+    ensure_scratch_dir(runtime)
+    console.print(f"[dim]swarm workspace → {active_workspace}[/dim]")
+
+    state = {"runtime": runtime, "provider": provider_name, "model_name": model}
+    result = run_swarm(state, team, task, agents=agent_names, max_rounds=max_rounds)
+
+    console.print(
+        Panel(
+            f"status: {result['status']}\nrounds: {result['rounds']}\n"
+            f"cycle: {result['cycle']}\nlog: {result['log_path']}",
+            title=f"🐝 Swarm '{team}' finished",
+            border_style="cyan",
+        )
+    )
+
+
+def run() -> None:
+    """Console-script entrypoint: route `linki swarm …` to the swarm app.
+
+    Everything else falls through to the default single-command task app, so the
+    familiar ``linki "<task>"`` invocation keeps working unchanged.
+    """
+
+    import sys
+
+    argv = sys.argv[1:]
+    if argv and argv[0] == "swarm":
+        # Re-run the swarm app as if it were invoked directly (drop the token).
+        sys.argv = [sys.argv[0], *argv[1:]]
+        swarm_app()
+    else:
+        app()

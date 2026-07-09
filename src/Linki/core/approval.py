@@ -75,6 +75,9 @@ class ApprovalRequest:
     risk_reason: str = ""
     tool_name: str = "BashTool"
     kind: str = KIND_COMMAND
+    # Optional presentation prefix, e.g. "[job-2 · reviewer]" for a request that
+    # originated inside a parallel dispatch job. Shown in the approval UI title.
+    label: str = ""
     # Populated for kind == "question".
     question: str = ""
     options: tuple[str, ...] = ()

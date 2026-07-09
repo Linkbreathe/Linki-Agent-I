@@ -4,7 +4,7 @@ from Linki.core.paths import resolve_workspace_path
 from Linki.core.state import RuntimeState
 
 PROTECTED_PATHS = (".linki/hooks.json", ".linki/hooks/", ".linki/memory/")
-PROTECTED_PATH_ERROR = "protected path: 策略文件对 Agent 只读"
+PROTECTED_PATH_ERROR = "protected path: policy files are read-only to the agent"
 
 
 def _display_path(state: RuntimeState, path: Path) -> str:

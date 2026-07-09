@@ -11,7 +11,9 @@ with the subagent's ``agent`` name.
 from __future__ import annotations
 
 import json
+import threading
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from typing import Any
 
@@ -23,9 +25,10 @@ from Linki.agents.registry import AgentSpec, load_agent_registry
 from Linki.core.approval import ApprovalDecision
 from Linki.core.state import RuntimeState
 from Linki.providers.openai_provider import create_model
-from Linki.tools.registry import AGENT_TOOL_NAME, build_subagent_tools
+from Linki.tools.registry import AGENT_DISPATCH_TOOL_NAME, AGENT_TOOL_NAME, build_subagent_tools
 
 MAX_SUBAGENT_LOOPS = 6
+MAX_PARALLEL_JOBS = 3
 
 
 class AgentToolInput(BaseModel):
@@ -93,34 +96,55 @@ def allowed_subagent_tools(runtime: RuntimeState, spec: AgentSpec) -> list[Struc
     ]
 
 
-def run_subagent(state: Any, spec: AgentSpec, prompt: str, *, description: str = "") -> str:
+def run_subagent(
+    state: Any,
+    spec: AgentSpec,
+    prompt: str,
+    *,
+    description: str = "",
+    job_id: str | None = None,
+    approval_lock: threading.Lock | None = None,
+    extra_tools: list[StructuredTool] | None = None,
+) -> str:
     """Run a subagent's isolated ReAct loop and return its final text.
 
     Tool calls run through the canonical pipeline; subagent messages are kept in
     an independent history and never appended to the parent graph messages.
+
+    When dispatched as one of several parallel jobs, ``job_id`` (e.g. "job-2")
+    is stamped onto every emitted event, and ``approval_lock`` serializes this
+    job's approval prompts against its siblings so only one popup is presented at
+    a time. The approval request is labelled ``[job-i · agent]`` for the UI.
+
+    ``extra_tools`` are appended to the spec's allowlisted pool — used by the
+    swarm scheduler to grant board/mailbox tools on top of the agent's own tools.
     """
 
     runtime = _runtime(state)
     agent_name = spec.name
     parent = _parent_label(state)
     sink = _resolve_sink(runtime)
+    job_label = f"[{job_id} · {agent_name}]" if job_id else ""
+
+    def _stamp(event: dict[str, Any]) -> dict[str, Any]:
+        payload = dict(event)
+        payload.setdefault("agent", agent_name)
+        if job_id:
+            payload.setdefault("job_id", job_id)
+        return payload
 
     def emit(event: dict[str, Any]) -> None:
         if sink is None:
             return
-        payload = dict(event)
-        payload.setdefault("agent", agent_name)
-        sink(payload)
+        sink(_stamp(event))
 
     # Wrap the runtime so tool/hook/approval events emitted deep inside
-    # execute_tool bubble up tagged with this subagent's name.
+    # execute_tool bubble up tagged with this subagent's name (and job id).
     if runtime is not None:
         def tagging_handler(event: dict[str, Any]) -> None:
             if sink is None:
                 return
-            payload = dict(event)
-            payload.setdefault("agent", agent_name)
-            sink(payload)
+            sink(_stamp(event))
 
         real_approval = runtime.approval_handler
 
@@ -131,17 +155,26 @@ def run_subagent(state: Any, spec: AgentSpec, prompt: str, *, description: str =
                     "tool": getattr(request, "tool_name", ""),
                     "reason": getattr(request, "risk_reason", ""),
                     "command": getattr(request, "command", ""),
+                    "label": job_label,
                 }
             )
             if real_approval is None:
                 return ApprovalDecision(approved=False, reason="no approval handler")
-            return real_approval(request)
+            labeled = replace(request, label=job_label) if job_label else request
+            # Serialize concurrent approvals so parallel jobs present one popup
+            # at a time rather than racing for the terminal.
+            if approval_lock is not None:
+                with approval_lock:
+                    return real_approval(labeled)
+            return real_approval(labeled)
 
         scoped_runtime = replace(runtime, event_handler=tagging_handler, approval_handler=approval_handler)
     else:
         scoped_runtime = runtime
 
     tools = allowed_subagent_tools(scoped_runtime, spec) if scoped_runtime is not None else []
+    if extra_tools:
+        tools = tools + list(extra_tools)
     tools_by_name = {tool.name: tool for tool in tools}
     agent = _model(state).bind_tools(tools) if tools else _model(state)
 
@@ -232,4 +265,118 @@ def make_agent_tool(state: Any) -> StructuredTool:
             "conversation, so the prompt must be complete."
         ),
         args_schema=AgentToolInput,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Parallel dispatch (Coordinator physical layer)
+# --------------------------------------------------------------------------- #
+
+
+class JobSpec(BaseModel):
+    subagent_type: str = Field(description="Registered agent type to run for this job.")
+    description: str = Field(description="Short 3-5 word label for traces and the TUI.")
+    prompt: str = Field(
+        description="Complete, self-contained task for this job. The subagent cannot "
+        "see the parent conversation."
+    )
+
+
+class AgentDispatchToolInput(BaseModel):
+    jobs: list[JobSpec] = Field(
+        description=f"Up to {MAX_PARALLEL_JOBS} independent subagent jobs to run in parallel."
+    )
+
+
+def _job_dict(job: Any) -> dict[str, Any]:
+    if isinstance(job, BaseModel):
+        return job.model_dump()
+    if isinstance(job, Mapping):
+        return dict(job)
+    return {}
+
+
+def _run_one_job(
+    state: Any,
+    registry: Mapping[str, AgentSpec],
+    job: Mapping[str, Any],
+    job_id: str,
+    approval_lock: threading.Lock,
+) -> str:
+    """Run a single dispatch job, returning a labelled line (never raising)."""
+
+    subagent_type = str(job.get("subagent_type", ""))
+    label = f"[{job_id} · {subagent_type or '?'}]"
+    spec = registry.get(subagent_type)
+    if spec is None:
+        available = ", ".join(sorted(registry)) or "(none)"
+        return f"{label} FAILED: unknown subagent type: {subagent_type} (available: {available})"
+
+    try:
+        summary = run_subagent(
+            state,
+            spec,
+            str(job.get("prompt", "")),
+            description=str(job.get("description", "")),
+            job_id=job_id,
+            approval_lock=approval_lock,
+        )
+    except Exception as exc:  # a single job's failure must not sink its siblings
+        return f"{label} FAILED: {type(exc).__name__}: {exc}"
+    return f"{label} {summary}"
+
+
+def dispatch_parallel(state: Any, jobs: list[Any]) -> str:
+    """Run up to ``MAX_PARALLEL_JOBS`` subagent jobs concurrently.
+
+    Extra jobs beyond the cap are dropped and reported in a trailing warning
+    line. Results are joined back in submission order; a job that raises is
+    replaced by a ``[job-i] FAILED: …`` placeholder so the batch always returns.
+    """
+
+    runtime = _runtime(state)
+    registry = load_agent_registry(runtime) if runtime is not None else {}
+
+    normalized = [_job_dict(job) for job in jobs]
+    accepted = normalized[:MAX_PARALLEL_JOBS]
+    dropped = len(normalized) - len(accepted)
+
+    approval_lock = threading.Lock()
+    results: list[str] = [""] * len(accepted)
+
+    with ThreadPoolExecutor(max_workers=MAX_PARALLEL_JOBS) as executor:
+        futures = {
+            executor.submit(
+                _run_one_job, state, registry, job, f"job-{index + 1}", approval_lock
+            ): index
+            for index, job in enumerate(accepted)
+        }
+        for future, index in futures.items():
+            results[index] = future.result()
+
+    combined = "\n\n".join(results)
+    if dropped > 0:
+        combined += (
+            f"\n\n[warning] AgentDispatchTool accepts at most {MAX_PARALLEL_JOBS} jobs "
+            f"per call; {dropped} extra job(s) were dropped."
+        )
+    return combined
+
+
+def make_agent_dispatch_tool(state: Any) -> StructuredTool:
+    """Build the planner-only AgentDispatchTool for parallel subagent dispatch."""
+
+    def agent_dispatch_tool(jobs: list[Any]) -> dict[str, Any]:
+        output = dispatch_parallel(state, jobs)
+        return {"ok": True, "name": AGENT_DISPATCH_TOOL_NAME, "output": output}
+
+    return StructuredTool.from_function(
+        func=agent_dispatch_tool,
+        name=AGENT_DISPATCH_TOOL_NAME,
+        description=(
+            "Dispatch up to three INDEPENDENT subagent jobs in parallel, each with a "
+            "self-contained prompt. Use only for genuinely independent research/review "
+            "work; the main implementation trunk stays serial. Extra jobs are dropped."
+        ),
+        args_schema=AgentDispatchToolInput,
     )

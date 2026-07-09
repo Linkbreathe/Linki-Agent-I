@@ -54,6 +54,25 @@ def test_cli_hook_decision_rendering_includes_agent(monkeypatch) -> None:
     assert "package install" in rendered
 
 
+def test_cli_agent_memory_upsert_rendering(monkeypatch) -> None:
+    console = Console(record=True, width=100)
+    monkeypatch.setattr(cli_app, "console", console)
+
+    cli_app._print_event(
+        {
+            "type": "memory_agent_upsert",
+            "action": "added",
+            "index": 4,
+            "text": "This project uses uv, not pip.",
+        }
+    )
+
+    rendered = console.export_text()
+    assert "🧠" in rendered
+    assert "Memory +1" in rendered
+    assert "This project uses uv" in rendered
+
+
 def test_cli_skill_load_rendering(monkeypatch) -> None:
     console = Console(record=True, width=100)
     monkeypatch.setattr(cli_app, "console", console)

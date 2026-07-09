@@ -14,3 +14,6 @@ __pycache__/
 .ruff_cache/
 dist/
 build/
+# Internal planning docs are kept local, never uploaded (the README screenshot
+# docs/linki-tui.png stays tracked).
+docs/*.md

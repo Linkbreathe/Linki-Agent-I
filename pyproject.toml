@@ -22,8 +22,8 @@ dependencies = [
 ]
 
 [project.scripts]
-Linki = "Linki.cli.app:app"
-linki = "Linki.cli.app:app"
+Linki = "Linki.cli.app:run"
+linki = "Linki.cli.app:run"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/Linki"]

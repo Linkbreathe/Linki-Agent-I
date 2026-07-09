@@ -24,6 +24,7 @@ from Linki.graph.memory import (
 from Linki.graph.state import AgentHandoff, LinkiGraphState, TodoItem, VerificationCheck, VerificationResult
 from Linki.providers.openai_provider import create_model
 from Linki.skills.registry import render_available_skills
+from Linki.prompts.coordinator import COORDINATOR_RULES
 from Linki.prompts.stage3 import (
     CHAT_RESPONDER_PROMPT,
     INTENT_ROUTER_PROMPT,
@@ -31,7 +32,7 @@ from Linki.prompts.stage3 import (
     PLANNER_PROMPT,
     VERIFIER_PROMPT,
 )
-from Linki.tools.agent_tool import make_agent_tool
+from Linki.tools.agent_tool import make_agent_dispatch_tool, make_agent_tool
 from Linki.tools.ask_user_tool import DEFAULT_ASK_BUDGET, make_ask_user_question_tool
 from Linki.tools.bash_tool import _decode_timeout_output, _validate_workspace_command
 from Linki.tools.executor import is_tool_result
@@ -378,8 +379,10 @@ def _build_planner_tools(
             description="Publish or revise the plan, todos, acceptance criteria, and verification commands.",
         ),
         # Research, documentation, and review are delegated to specialist
-        # subagents through the unified AgentTool.
+        # subagents through the unified AgentTool. AgentDispatchTool fans several
+        # INDEPENDENT jobs out in parallel and is planner-only by design.
         make_agent_tool(working),
+        make_agent_dispatch_tool(working),
         make_memory_upsert_tool(working),
         # Pull a skill's full instructions on demand (progressive disclosure).
         make_skill_tool(working),
@@ -457,6 +460,8 @@ def _planner_input(working_state: Mapping[str, Any], memory: LayeredMemory) -> s
     available_agents = _available_agents_block(working_state)
     if available_agents:
         parts.append(available_agents)
+    # Coordinator delegation discipline sits right after the agent catalog.
+    parts.append(COORDINATOR_RULES)
     available_skills = render_available_skills(working_state)
     if available_skills:
         parts.append(available_skills)
@@ -523,9 +528,10 @@ def planner_node(state: LinkiGraphState) -> dict:
         working["plan_feedback"] = None
 
     # Keep every non-empty assistant message, not just the last one: the planner
-    # often emits the substantive answer and then a short sign-off ("任务完成！"),
-    # and the verifier reads last_actor_summary as the delivered output. Taking
-    # only the final message would let a trailing pleasantry erase the answer.
+    # often emits the substantive answer and then a short sign-off (e.g. a
+    # trailing "Task complete!"), and the verifier reads last_actor_summary as the
+    # delivered output. Taking only the final message would let a trailing
+    # pleasantry erase the answer.
     supervisor_messages: list[str] = []
     for event in _react_events(agent, messages, tools_by_name, node="planner", max_loops=10):
         if event["type"] == "ai_message":

@@ -15,6 +15,18 @@ def ensure_workspace(state: RuntimeState, create: bool = True) -> Path:
     return state.workspace
 
 
+def ensure_scratch_dir(state: RuntimeState) -> Path:
+    """Return the workspace scratchpad (``.linki/scratch``), creating it.
+
+    Subagents write large findings here and pass the path downstream instead of
+    embedding the content in prompts (see the coordinator rules).
+    """
+
+    scratch = state.workspace / ".linki" / "scratch"
+    scratch.mkdir(parents=True, exist_ok=True)
+    return scratch
+
+
 def resolve_workspace_path(state: RuntimeState, file_path: str | Path) -> Path:
     """Resolve a user path and reject paths outside the workspace."""
 
