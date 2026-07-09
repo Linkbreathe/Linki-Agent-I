@@ -2,6 +2,7 @@ import json
 import re
 import subprocess
 from collections.abc import Iterable, Iterator, Mapping
+from dataclasses import replace
 from typing import Any, cast
 
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, ToolMessage
@@ -87,6 +88,33 @@ def _emit_custom_event(event: Mapping[str, Any]) -> None:
     except (RuntimeError, KeyError):
         return
     writer(dict(event))
+
+
+def _scoped_runtime(runtime: RuntimeState, node: str) -> RuntimeState:
+    """Attach a default node to runtime events emitted by tools/hooks."""
+
+    parent_handler = runtime.event_handler
+
+    def handler(event: dict[str, Any]) -> None:
+        payload = dict(event)
+        payload.setdefault("node", node)
+        if parent_handler is not None:
+            parent_handler(payload)
+        else:
+            _emit_custom_event(payload)
+
+    return replace(runtime, event_handler=handler)
+
+
+def _ai_message_event(response: Any, *, node: str) -> dict[str, Any]:
+    event: dict[str, Any] = {"type": "ai_message", "node": node, "content": _message_content(response)}
+    usage = getattr(response, "usage_metadata", None)
+    if isinstance(usage, Mapping):
+        event["usage_metadata"] = dict(usage)
+    metadata = getattr(response, "response_metadata", None)
+    if isinstance(metadata, Mapping):
+        event["response_metadata"] = dict(metadata)
+    return event
 
 
 def _json_from_text(text: str) -> dict[str, Any]:
@@ -282,7 +310,7 @@ def _react_events(
     for _ in range(max_loops):
         response = agent.invoke(messages)
         messages.append(response)
-        event = {"type": "ai_message", "node": node, "content": _message_content(response)}
+        event = _ai_message_event(response, node=node)
         _emit_custom_event(event)
         yield {**event, "message": response}
 
@@ -472,7 +500,7 @@ def _planner_input(working_state: Mapping[str, Any], memory: LayeredMemory) -> s
 def planner_node(state: LinkiGraphState) -> dict:
     """Run the planner/supervisor node and delegate work through tools."""
 
-    runtime = _runtime(state)
+    runtime = _scoped_runtime(_runtime(state), "planner")
 
     working: dict[str, Any] = {
         "task": state.get("task", ""),
@@ -671,7 +699,7 @@ def _verifier_input(working_state: Mapping[str, Any], memory: LayeredMemory) -> 
 def verifier_node(state: LinkiGraphState) -> dict:
     """Verify actor output, run verification commands, and update graph status."""
 
-    runtime = _runtime(state)
+    runtime = _scoped_runtime(_runtime(state), "verifier")
     verification_results = [
         _run_verification_command(runtime, command)
         for command in state.get("verification_commands", [])
@@ -681,7 +709,7 @@ def verifier_node(state: LinkiGraphState) -> dict:
     tools_by_name = {tool.name: tool for tool in tools}
     agent = _model(state).bind_tools(tools)
 
-    working_state: dict[str, Any] = {**state, "verification_results": verification_results}
+    working_state: dict[str, Any] = {**state, "runtime": runtime, "verification_results": verification_results}
     memory = build_layered_memory(working_state, node="verifier")
     _emit_custom_event(memory_event(memory, node="verifier"))
 

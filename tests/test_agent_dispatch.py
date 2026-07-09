@@ -17,7 +17,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _seed_workspace_agents(workspace: Path) -> None:
-    src = PROJECT_ROOT / ".linki" / "agents"
+    src = PROJECT_ROOT / "src" / "Linki" / "agents" / "builtin"
     dst = workspace / ".linki" / "agents"
     dst.mkdir(parents=True, exist_ok=True)
     for md in src.glob("*.md"):
@@ -115,6 +115,25 @@ def test_one_job_fails_others_succeed(tmp_path: Path) -> None:
     assert "FAILED" in output
     # The two healthy jobs still produced their summaries.
     assert output.count("ok-summary") == 2
+
+
+def test_failed_parallel_job_emits_terminal_subagent_result(tmp_path: Path) -> None:
+    _seed_workspace_agents(tmp_path)
+    events: list[dict] = []
+    runtime = create_runtime(tmp_path, event_handler=events.append)
+    state = {"runtime": runtime, "model": ConditionalModel()}
+    tool = make_agent_dispatch_tool(state)
+
+    tool.invoke({"jobs": [_job("search-agent", "BOOM")]})
+
+    failures = [
+        event
+        for event in events
+        if event.get("type") == "subagent_result" and event.get("ok") is False
+    ]
+    assert failures
+    assert failures[0]["job_id"] == "job-1"
+    assert failures[0]["agent"] == "search-agent"
 
 
 def test_fourth_job_truncated_with_warning(tmp_path: Path) -> None:

@@ -907,6 +907,14 @@ class LinkiTuiApp(App[None]):
             self._write_event(f"{prefix}⚠ Approval requested: {tool}{suffix}", detail=event, kind="error")
             return
 
+        if event_type == "approval_decision":
+            prefix = self._subagent_prefix(event)
+            tool = event.get("tool") or "tool"
+            approved = bool(event.get("approved"))
+            label = "approved" if approved else "denied"
+            self._write_event(f"{prefix}Approval {label}: {tool}", detail=event, kind="success" if approved else "error")
+            return
+
         if event_type == "hook_decision":
             prefix = self._subagent_prefix(event)
             label, kind = self._hook_decision_label(event)

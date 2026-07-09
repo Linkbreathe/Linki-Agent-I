@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import threading
 from collections.abc import Mapping
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from typing import Any
 
@@ -65,6 +65,17 @@ def _message_text(message: Any) -> str:
     if isinstance(content, str):
         return content
     return json.dumps(content, ensure_ascii=False)
+
+
+def _ai_message_event(message: Any) -> dict[str, Any]:
+    event: dict[str, Any] = {"type": "ai_message", "content": _message_text(message)}
+    usage = getattr(message, "usage_metadata", None)
+    if isinstance(usage, Mapping):
+        event["usage_metadata"] = dict(usage)
+    metadata = getattr(message, "response_metadata", None)
+    if isinstance(metadata, Mapping):
+        event["response_metadata"] = dict(metadata)
+    return event
 
 
 def _resolve_sink(runtime: RuntimeState | None):
@@ -129,6 +140,7 @@ def run_subagent(
     def _stamp(event: dict[str, Any]) -> dict[str, Any]:
         payload = dict(event)
         payload.setdefault("agent", agent_name)
+        payload.setdefault("node", parent)
         if job_id:
             payload.setdefault("job_id", job_id)
         return payload
@@ -149,26 +161,21 @@ def run_subagent(
         real_approval = runtime.approval_handler
 
         def approval_handler(request: Any) -> ApprovalDecision:
-            emit(
-                {
-                    "type": "approval_requested",
-                    "tool": getattr(request, "tool_name", ""),
-                    "reason": getattr(request, "risk_reason", ""),
-                    "command": getattr(request, "command", ""),
-                    "label": job_label,
-                }
-            )
             if real_approval is None:
                 return ApprovalDecision(approved=False, reason="no approval handler")
-            labeled = replace(request, label=job_label) if job_label else request
             # Serialize concurrent approvals so parallel jobs present one popup
             # at a time rather than racing for the terminal.
             if approval_lock is not None:
                 with approval_lock:
-                    return real_approval(labeled)
-            return real_approval(labeled)
+                    return real_approval(request)
+            return real_approval(request)
 
-        scoped_runtime = replace(runtime, event_handler=tagging_handler, approval_handler=approval_handler)
+        scoped_runtime = replace(
+            runtime,
+            event_handler=tagging_handler,
+            approval_handler=approval_handler,
+            approval_label=job_label,
+        )
     else:
         scoped_runtime = runtime
 
@@ -197,6 +204,7 @@ def run_subagent(
         response = agent.invoke(messages)
         messages.append(response)
         summary = _message_text(response)
+        emit(_ai_message_event(response))
 
         tool_calls = getattr(response, "tool_calls", None) or []
         if not tool_calls:
@@ -227,7 +235,7 @@ def run_subagent(
     else:
         summary = summary or f"subagent '{agent_name}' reached the {MAX_SUBAGENT_LOOPS}-step limit"
 
-    emit({"type": "subagent_result", "description": description, "parent": parent, "summary": summary})
+    emit({"type": "subagent_result", "description": description, "parent": parent, "summary": summary, "ok": True})
     return summary
 
 
@@ -306,22 +314,57 @@ def _run_one_job(
     """Run a single dispatch job, returning a labelled line (never raising)."""
 
     subagent_type = str(job.get("subagent_type", ""))
+    description = str(job.get("description", ""))
     label = f"[{job_id} · {subagent_type or '?'}]"
-    spec = registry.get(subagent_type)
-    if spec is None:
-        available = ", ".join(sorted(registry)) or "(none)"
-        return f"{label} FAILED: unknown subagent type: {subagent_type} (available: {available})"
+
+    def emit_failure(*, subagent_type: str, description: str, error_type: str, error: str) -> None:
+        runtime = _runtime(state)
+        sink = _resolve_sink(runtime)
+        if sink is None:
+            return
+        sink(
+            {
+                "type": "subagent_result",
+                "agent": subagent_type or "?",
+                "node": _parent_label(state),
+                "parent": _parent_label(state),
+                "job_id": job_id,
+                "description": description,
+                "summary": f"FAILED: {error_type}: {error}",
+                "ok": False,
+                "error_type": error_type,
+                "error": error,
+            }
+        )
 
     try:
+        spec = registry.get(subagent_type)
+        if spec is None:
+            available = ", ".join(sorted(registry)) or "(none)"
+            error = f"unknown subagent type: {subagent_type} (available: {available})"
+            emit_failure(
+                subagent_type=subagent_type,
+                description=description,
+                error_type="UnknownSubagent",
+                error=error,
+            )
+            return f"{label} FAILED: {error}"
+
         summary = run_subagent(
             state,
             spec,
             str(job.get("prompt", "")),
-            description=str(job.get("description", "")),
+            description=description,
             job_id=job_id,
             approval_lock=approval_lock,
         )
     except Exception as exc:  # a single job's failure must not sink its siblings
+        emit_failure(
+            subagent_type=locals().get("subagent_type", ""),
+            description=str(job.get("description", "")),
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
         return f"{label} FAILED: {type(exc).__name__}: {exc}"
     return f"{label} {summary}"
 
@@ -344,15 +387,42 @@ def dispatch_parallel(state: Any, jobs: list[Any]) -> str:
     approval_lock = threading.Lock()
     results: list[str] = [""] * len(accepted)
 
-    with ThreadPoolExecutor(max_workers=MAX_PARALLEL_JOBS) as executor:
-        futures = {
-            executor.submit(
-                _run_one_job, state, registry, job, f"job-{index + 1}", approval_lock
-            ): index
-            for index, job in enumerate(accepted)
-        }
-        for future, index in futures.items():
-            results[index] = future.result()
+    if accepted:
+        # Resolve the stream sink in the caller thread and inject it into the
+        # worker runtime. LangGraph's stream writer is context-local and is not
+        # reliably available from ThreadPoolExecutor workers.
+        dispatch_state = state
+        sink = _resolve_sink(runtime)
+        if runtime is not None and sink is not None:
+            scoped_runtime = replace(runtime, event_handler=sink)
+            if isinstance(state, RuntimeState):
+                dispatch_state = scoped_runtime
+            elif isinstance(state, Mapping):
+                dispatch_state = {**state, "runtime": scoped_runtime}
+
+        futures = {}
+        with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_JOBS, len(accepted))) as executor:
+            for index, job in enumerate(accepted):
+                job_id = f"job-{index + 1}"
+                try:
+                    future = executor.submit(
+                        _run_one_job, dispatch_state, registry, job, job_id, approval_lock
+                    )
+                except Exception as exc:
+                    subagent_type = str(job.get("subagent_type", ""))
+                    results[index] = f"[{job_id} · {subagent_type or '?'}] FAILED: {type(exc).__name__}: {exc}"
+                    continue
+                futures[future] = index
+
+            for future in as_completed(futures):
+                index = futures[future]
+                job = accepted[index]
+                job_id = f"job-{index + 1}"
+                subagent_type = str(job.get("subagent_type", ""))
+                try:
+                    results[index] = future.result()
+                except Exception as exc:
+                    results[index] = f"[{job_id} · {subagent_type or '?'}] FAILED: {type(exc).__name__}: {exc}"
 
     combined = "\n\n".join(results)
     if dropped > 0:

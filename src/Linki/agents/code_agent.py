@@ -1,5 +1,6 @@
 import json
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from typing import Any
 
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, ToolMessage
@@ -81,6 +82,21 @@ def _message_content(message: Any) -> str:
     if isinstance(content, str):
         return content
     return json.dumps(content, ensure_ascii=False)
+
+
+def _ai_message_event(response: Any) -> dict[str, Any]:
+    event: dict[str, Any] = {
+        "type": "ai_message",
+        "node": "codeAgent",
+        "content": _message_content(response),
+    }
+    usage = getattr(response, "usage_metadata", None)
+    if isinstance(usage, Mapping):
+        event["usage_metadata"] = dict(usage)
+    metadata = getattr(response, "response_metadata", None)
+    if isinstance(metadata, Mapping):
+        event["response_metadata"] = dict(metadata)
+    return event
 
 
 def _format_json(value: Any) -> str:
@@ -238,56 +254,68 @@ def run_code_agent(
     message trace, and the raw tool events emitted along the way.
     """
 
-    runtime = _runtime(state)
+    base_runtime = _runtime(state)
     values = state if isinstance(state, Mapping) else {}
+
+    tool_events: list[dict[str, Any]] = []
+
+    def _emit(event: dict[str, Any]) -> None:
+        payload = dict(event)
+        payload.setdefault("node", "codeAgent")
+        tool_events.append(payload)
+        if writer is not None:
+            writer(dict(payload))
+        elif base_runtime.event_handler is not None:
+            base_runtime.event_handler(dict(payload))
+
+    scoped_runtime = replace(base_runtime, event_handler=_emit)
+    agent_state: Any
+    if isinstance(values, Mapping):
+        agent_state = {**values, "runtime": scoped_runtime, "current_node": "codeAgent"}
+    else:
+        agent_state = state
+
     # Defense-in-depth: even if reached in plan mode, keep the code agent read-only.
     tools = build_tools(
-        runtime,
+        scoped_runtime,
         plan_mode=bool(values.get("plan_mode")),
         ask_budget_left=values.get("ask_budget"),
     )
     # codeAgent may dispatch specialist subagents (e.g. doc-writer, reviewer)
     # and pull skill instructions on demand.
-    if runtime is not None:
-        tools = tools + [make_agent_tool(state), make_skill_tool(state)]
+    if scoped_runtime is not None:
+        tools = tools + [make_agent_tool(agent_state), make_skill_tool(agent_state)]
     tools_by_name = {tool.name: tool for tool in tools}
 
     todos = [_todo_dict(todo, index) for index, todo in enumerate(values.get("todos") or [])]
 
-    agent = _model(state).bind_tools(tools + [TodoUpdateTool])
+    agent = _model(agent_state).bind_tools(tools + [TodoUpdateTool])
 
-    memory = build_layered_memory(state, node="codeAgent")
-    if writer is not None:
-        writer(memory_event(memory, node="codeAgent"))
+    memory = build_layered_memory(agent_state, node="codeAgent")
+    _emit(memory_event(memory, node="codeAgent"))
 
     messages: list[BaseMessage] = [
         SystemMessage(content=CODE_AGENT_PROMPT),
-        HumanMessage(content=_code_agent_input(state, instruction, memory)),
+        HumanMessage(content=_code_agent_input(agent_state, instruction, memory)),
     ]
 
-    tool_events: list[dict[str, Any]] = []
     summary = ""
-
-    def _emit(event: dict[str, Any]) -> None:
-        tool_events.append(event)
-        if writer is not None:
-            writer(dict(event))
 
     for _ in range(max_loops):
         response = agent.invoke(messages)
         messages.append(response)
         summary = _message_content(response)
-        _emit({"type": "ai_message", "content": summary})
+        _emit(_ai_message_event(response))
 
         tool_calls = getattr(response, "tool_calls", None) or []
         if not tool_calls:
             break
 
         for call in tool_calls:
-            _emit({"type": "tool_call", "name": call["name"], "args": call.get("args", {})})
+            _emit({"type": "tool_call", "node": "codeAgent", "name": call["name"], "args": call.get("args", {})})
 
             result = _execute_call(call, tools_by_name, todos)
-            _emit({"type": "tool_result", "name": call["name"], "result": result})
+            _emit({"type": "tool_result", "node": "codeAgent", "name": call["name"], "result": result})
 
             messages.append(
                 ToolMessage(

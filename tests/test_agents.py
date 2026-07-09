@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import json
+import sys
 from pathlib import Path
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from Linki.agents.registry import load_agent_registry, parse_frontmatter_markdown
+from Linki.agents.code_agent import run_code_agent
 from Linki.core.state import create_runtime
 from Linki.tools.agent_tool import allowed_subagent_tools, make_agent_tool, run_subagent
 
@@ -22,7 +25,7 @@ class FakeModel:
         self.bound_tool_names: list[str] = []
 
     def bind_tools(self, tools):
-        self.bound_tool_names = [t.name for t in tools]
+        self.bound_tool_names = [getattr(t, "name", getattr(t, "__name__", "")) for t in tools]
         return self
 
     def invoke(self, messages):
@@ -30,7 +33,7 @@ class FakeModel:
 
 
 def _seed_workspace_agents(workspace: Path) -> None:
-    src = PROJECT_ROOT / ".linki" / "agents"
+    src = PROJECT_ROOT / "src" / "Linki" / "agents" / "builtin"
     dst = workspace / ".linki" / "agents"
     dst.mkdir(parents=True, exist_ok=True)
     for md in src.glob("*.md"):
@@ -262,3 +265,46 @@ def test_approval_allows_execution_when_approved(tmp_path: Path) -> None:
 
     tool_results = [e for e in events if e.get("type") == "tool_result" and e["name"] == "BashTool"]
     assert tool_results and tool_results[0]["result"]["ok"] is True
+
+
+def test_code_agent_events_are_attributed_to_code_agent(tmp_path: Path) -> None:
+    hooks_dir = tmp_path / ".linki" / "hooks"
+    hooks_dir.mkdir(parents=True)
+    (hooks_dir / "allow.py").write_text("print('{}')\n", encoding="utf-8")
+    (tmp_path / ".linki" / "hooks.json").write_text(
+        json.dumps(
+            {
+                "PreToolUse": [
+                    {
+                        "matcher": "FileReadTool",
+                        "command": f"{sys.executable} .linki/hooks/allow.py",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "sample.txt").write_text("hello", encoding="utf-8")
+    events: list[dict] = []
+    runtime = create_runtime(tmp_path)
+    fake = FakeModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"name": "FileReadTool", "args": {"file_path": "sample.txt"}, "id": "read-1"}
+                ],
+            ),
+            AIMessage(content="done"),
+        ]
+    )
+
+    run_code_agent({"runtime": runtime, "model": fake}, "read sample", writer=events.append)
+
+    attributed = [
+        event
+        for event in events
+        if event.get("type") in {"ai_message", "tool_call", "tool_result", "hook_decision"}
+    ]
+    assert attributed
+    assert all(event.get("node") == "codeAgent" for event in attributed)

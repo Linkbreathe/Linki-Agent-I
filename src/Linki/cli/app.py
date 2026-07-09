@@ -12,6 +12,7 @@ import typer
 from Linki.core.approval import KIND_PLAN, KIND_QUESTION, ApprovalDecision, ApprovalRequest
 from Linki.core.agent import _parse_graph_event, stream_agent_events, stream_session_events
 from Linki.core.session import create_run_workspace
+from Linki.providers.openai_provider import validate_provider_config
 
 app = typer.Typer(no_args_is_help=True)
 console = Console()
@@ -654,6 +655,17 @@ def _print_event(event: dict, *, verbose: bool = False) -> None:
         )
         return
 
+    if event_type == "approval_decision":
+        approved = bool(event.get("approved"))
+        console.print(
+            Panel(
+                _json_block(event),
+                title=_subagent_title(event, "Approval approved" if approved else "Approval denied"),
+                border_style="green" if approved else "red",
+            )
+        )
+        return
+
     if event_type == "hook_decision":
         decision = str(event.get("decision") or "")
         style = "red" if decision == "deny" else "yellow" if decision == "ask" else "green"
@@ -814,6 +826,16 @@ def main(
     if trace_mode not in {"on", "off"}:
         raise typer.BadParameter("trace-mode must be 'on' or 'off'")
 
+    if task is None and resume is None and not tui:
+        raise typer.BadParameter("task is required unless --resume is provided")
+
+    if not tui or task is not None or resume is not None:
+        try:
+            validate_provider_config(provider_name, model)
+        except ValueError as exc:
+            typer.secho(str(exc), err=True, fg=typer.colors.RED)
+            raise typer.Exit(code=1) from exc
+
     # Resuming targets an exact run folder; a fresh start gets a brand-new
     # run-<timestamp> folder under the base directory so checkpoints from a
     # previous run are never overwritten.
@@ -834,9 +856,6 @@ def main(
             plan_mode=plan,
         ).run()
         return
-
-    if task is None and resume is None:
-        raise typer.BadParameter("task is required unless --resume is provided")
 
     approval_handler = _cli_approval_handler if approval_mode == "inline" else None
     if resume is None:
@@ -935,6 +954,11 @@ def swarm(
     provider_name = provider.lower()
     if provider_name not in {"openai", "deepseek"}:
         raise typer.BadParameter("provider must be 'openai' or 'deepseek'")
+    try:
+        validate_provider_config(provider_name, model)
+    except ValueError as exc:
+        typer.secho(str(exc), err=True, fg=typer.colors.RED)
+        raise typer.Exit(code=1) from exc
 
     agent_names = [name.strip() for name in agents.split(",") if name.strip()]
     if not agent_names:

@@ -22,7 +22,7 @@ from Linki.core.state import create_runtime
 from Linki.core.trace import TraceRecorder
 from Linki.skills.registry import load_skills_into_runtime
 from Linki.graph.workflow import build_complex_workflow, build_entry_workflow
-from Linki.providers.openai_provider import create_model
+from Linki.providers.openai_provider import create_model, validate_provider_config
 
 
 def _message_content(message: BaseMessage) -> str:
@@ -216,8 +216,12 @@ def stream_agent_events(
     session_turn: int = 0,
     session_context: str = "",
     plan_mode: bool = False,
+    preface_events: list[Mapping[str, Any]] | None = None,
 ) -> Iterator[dict]:
     """Stream graph/custom events while recording checkpoints and traces."""
+
+    if model is None:
+        validate_provider_config(provider, model_name)
 
     runtime = create_runtime(
         workspace,
@@ -305,6 +309,11 @@ def stream_agent_events(
             resume_event=resume_event,
         )
         trace_started = True
+
+        for preface_event in preface_events or []:
+            trace.record_graph_update(preface_event)
+            current_state = _merge_graph_update(current_state, preface_event)
+            latest_node = _extract_latest_node(preface_event, default=latest_node)
 
         checkpoint_event = manager.save(
             current_state,
@@ -472,6 +481,8 @@ def stream_session_events(
     provider = str(kwargs.pop("provider", "openai"))
     model_name = kwargs.pop("model_name", None)
     model = kwargs.pop("model", None)
+    if model is None:
+        validate_provider_config(provider, model_name)
 
     runtime = create_runtime(
         workspace,
@@ -505,6 +516,7 @@ def stream_session_events(
     intent_reason = ""
     intent_confidence = 0.0
     assistant_recorded = False
+    entry_trace_events: list[Mapping[str, Any]] = []
 
     try:
         entry_state = dict(entry_inputs)
@@ -526,6 +538,7 @@ def stream_session_events(
 
             graph_event = _ensure_event_mapping(event)
             entry_state = _merge_graph_update(entry_state, graph_event)
+            entry_trace_events.append(dict(graph_event))
             yield {
                 "type": "graph_event",
                 "event": graph_event,
@@ -567,6 +580,18 @@ def stream_session_events(
                 "session_id": session["session_id"],
                 "turn": turn,
             }
+            trace = TraceRecorder(runtime, task=task)
+            latest = "start"
+            trace.start(entry_inputs, resumed=False)
+            for graph_event in entry_trace_events:
+                trace.record_graph_update(graph_event)
+                latest = _extract_latest_node(graph_event, default=latest) or latest
+            trace_summary = trace.end(
+                status="finished",
+                latest_node=latest,
+                final_state=entry_state,
+            )
+            yield {"type": "trace_finished", "trace": trace_summary}
             return
 
         final_answer = ""
@@ -585,6 +610,7 @@ def stream_session_events(
             session_turn=turn,
             session_context=session_context,
             plan_mode=plan_mode,
+            preface_events=entry_trace_events,
         ):
             if event.get("type") == "graph_event":
                 inner = event.get("event")

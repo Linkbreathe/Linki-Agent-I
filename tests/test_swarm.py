@@ -17,7 +17,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _seed_workspace_agents(workspace: Path) -> None:
-    src = PROJECT_ROOT / ".linki" / "agents"
+    src = PROJECT_ROOT / "src" / "Linki" / "agents" / "builtin"
     dst = workspace / ".linki" / "agents"
     dst.mkdir(parents=True, exist_ok=True)
     for md in src.glob("*.md"):

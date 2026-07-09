@@ -4,6 +4,74 @@ from uuid import uuid4
 
 RISK_PATTERNS = [
     (
+        r"(?:^|&&|\|\||;)\s*rm\s+-[^\s]*r[^\s]*f[^\s]*\b",
+        "Recursive forced remove",
+    ),
+    (
+        r"(?:^|&&|\|\||;)\s*rm\s+-[^\s]*f[^\s]*r[^\s]*\b",
+        "Recursive forced remove",
+    ),
+    (
+        r"(?:^|&&|\|\||;)\s*git\s+reset\s+--hard\b",
+        "Git hard reset discards local work",
+    ),
+    (
+        r"(?:^|&&|\|\||;)\s*git\s+clean\s+-[^\s]*f[^\s]*d[^\s]*x?[^\s]*\b",
+        "Git clean removes untracked files",
+    ),
+    (
+        r"(?:^|&&|\|\||;)\s*git\s+push\b.*\s--force(?:-with-lease)?\b",
+        "Force push can overwrite remote history",
+    ),
+    (
+        r"(?:^|&&|\|\||;)\s*git\s+push\b.*\s--delete\b",
+        "Remote branch deletion",
+    ),
+    (
+        r"(?:^|&&|\|\||;)\s*mkfs(?:\.[\w-]+)?\b",
+        "Filesystem creation command",
+    ),
+    (
+        r"(?:^|&&|\|\||;)\s*dd\b.*\bof=/dev/\S+",
+        "Raw device write with dd",
+    ),
+    (
+        r"(?:^|&&|\|\||;)\s*shred\b",
+        "Secure deletion command",
+    ),
+    (
+        r":\(\)\s*\{\s*:\|:&\s*};:",
+        "Fork bomb",
+    ),
+    (
+        r"(?:^|&&|\|\||;)\s*(?:curl|wget)\b.*\|\s*(?:sudo\s+)?(?:sh|bash|dash|zsh|fish)\b",
+        "Remote download piped to shell",
+    ),
+    (
+        r"(?:^|&&|\|\||;)\s*sudo\b",
+        "Privilege escalation with sudo",
+    ),
+    (
+        r"(?:^|&&|\|\||;)\s*su\s+-",
+        "Privilege escalation with su",
+    ),
+    (
+        r"(?:^|&&|\|\||;)\s*chmod\s+(?:[0-7]*7[0-7]*7|777)\b",
+        "Overly permissive chmod",
+    ),
+    (
+        r"/dev/(?:tcp|udp)/",
+        "Shell network redirection",
+    ),
+    (
+        r"(?:^|&&|\|\||;)\s*nc\b.*\s-e\b",
+        "Netcat command execution",
+    ),
+    (
+        r"(?:^|&&|\|\||;)\s*curl\b.*\s-F\s+[^=]*=@",
+        "File upload with curl",
+    ),
+    (
         r"(?:^|&&|\|\||;)\s*(?:python\s+-m\s+)?pip\s+install\b",
         "Python package installation",
     ),

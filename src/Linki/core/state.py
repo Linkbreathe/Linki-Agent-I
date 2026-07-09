@@ -15,6 +15,7 @@ class RuntimeState:
     checkpoint_mode: str | None = None
     trace_mode: str | None = None
     trace_id: str | None = None
+    approval_label: str = ""
     resume_from: Path | None = None
     event_handler: Callable[[dict[str, Any]], None] | None = None
     recent_files: OrderedDict[str, None] = field(default_factory=OrderedDict)

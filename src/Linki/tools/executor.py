@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from typing import Any
 
 from Linki.core.approval import (
@@ -81,6 +82,53 @@ def _approval_info(request: ApprovalRequest, decision: ApprovalDecision) -> dict
     }
 
 
+def _emit_runtime_event(state: RuntimeState, event: dict[str, Any]) -> None:
+    handler = getattr(state, "event_handler", None)
+    if handler is not None:
+        handler(dict(event))
+        return
+
+    try:
+        from langgraph.config import get_stream_writer
+
+        writer = get_stream_writer()
+    except (ImportError, RuntimeError, KeyError):
+        return
+    writer(dict(event))
+
+
+def _emit_approval_requested(state: RuntimeState, request: ApprovalRequest) -> None:
+    _emit_runtime_event(
+        state,
+        {
+            "type": "approval_requested",
+            "tool": request.tool_name,
+            "reason": request.risk_reason,
+            "command": request.command,
+            "label": request.label,
+            "approval_request_id": request.id,
+        },
+    )
+
+
+def _emit_approval_decision(
+    state: RuntimeState,
+    request: ApprovalRequest,
+    decision: ApprovalDecision,
+) -> None:
+    _emit_runtime_event(
+        state,
+        {
+            "type": "approval_decision",
+            "tool": request.tool_name,
+            "approval_request_id": request.id,
+            "approved": decision.approved,
+            "reason": decision.reason,
+            "label": request.label,
+        },
+    )
+
+
 def _request_approval(
     state: RuntimeState,
     *,
@@ -96,21 +144,29 @@ def _request_approval(
         risk_reason,
         tool_name=tool_name,
     )
+    label = str(getattr(state, "approval_label", "") or "")
+    if label:
+        request = replace(request, label=label)
+    _emit_approval_requested(state, request)
 
     if mode == "deny":
         decision = ApprovalDecision(approved=False, reason="approval mode denied")
+        _emit_approval_decision(state, request, decision)
         return False, _approval_info(request, decision)
 
     if mode == "auto" and not force_inline:
         decision = ApprovalDecision(approved=True, reason="approval mode auto")
+        _emit_approval_decision(state, request, decision)
         return True, _approval_info(request, decision)
 
     handler = getattr(state, "approval_handler", None)
     if handler is None:
         decision = ApprovalDecision(approved=False, reason="approval handler unavailable")
+        _emit_approval_decision(state, request, decision)
         return False, _approval_info(request, decision)
 
     decision = handler(request)
+    _emit_approval_decision(state, request, decision)
     return bool(decision.approved), _approval_info(request, decision)
 
 
