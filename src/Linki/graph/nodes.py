@@ -743,6 +743,7 @@ def context_monitor_node(state: LinkiGraphState) -> dict:
 
     return {
         "context_token_count": token_count,
+        "context_token_limit": token_limit,
         "context_should_compress": should_compress,
         "context_next_node": state.get("context_next_node", "verifier"),
     }

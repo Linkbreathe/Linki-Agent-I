@@ -5,6 +5,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from rich.markdown import Markdown
 from rich.table import Table
 from rich.text import Text
 from textual import events
@@ -31,6 +32,15 @@ TODO_RENDER = {
     "pending": ("○", "dim"),
 }
 PROGRESS_BAR_WIDTH = 18
+CTX_BAR_WIDTH = 12
+CTX_TOKEN_LIMIT_DEFAULT = 400_000
+
+# Sidebar state-dot style per running state.
+STATE_STYLES = {
+    "starting": "bold cyan",
+    "idle": "bold green",
+    "running": "bold yellow",
+}
 
 # Slash commands offered by the input autocomplete: (name, description).
 SLASH_COMMANDS: list[tuple[str, str]] = [
@@ -240,6 +250,15 @@ class LinkiTuiApp(App[None]):
         self._session_id: str = ""
         self._state_label: str = "starting"
         self._last_messages: list[Any] = []
+
+        # Cockpit status, kept in sync from streamed events.
+        self._turn_index: int | None = None
+        self._active_agent: str = ""
+        self._attempts: int = 0
+        self._max_attempts_seen: int = 0
+        self._verify_passed: bool | None = None
+        self._ctx_tokens: int = 0
+        self._ctx_limit: int = CTX_TOKEN_LIMIT_DEFAULT
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -513,12 +532,68 @@ class LinkiTuiApp(App[None]):
 
     def _refresh_session_line(self) -> None:
         line = Text()
-        line.append("● ", style="bold cyan")
-        line.append(f"{self._state_label}\n", style="bold")
+        line.append("● ", style=STATE_STYLES.get(self._state_label, "bold cyan"))
+        line.append(self._state_label, style="bold")
+        if self._turn_index is not None:
+            line.append(f" · turn {self._turn_index}", style="dim")
+        line.append("\n")
         short_id = self._session_id[:8] if self._session_id else "—"
-        line.append(f"session {short_id}\n", style="dim")
-        line.append(self.workspace.name, style="dim italic")
+        line.append(f"session {short_id} · ", style="dim")
+        line.append(f"{self.workspace.name}\n", style="dim italic")
+        line.append(f"{self.provider} · {self.model_name or 'default model'}\n", style="dim")
+        if self._active_agent:
+            line.append("🤖 ", style="bold")
+            line.append(f"{self._active_agent}\n", style="bold magenta")
+        if self._verify_passed is not None or self._attempts:
+            icon, style = ("✔", "bold green") if self._verify_passed else ("⟳", "bold yellow")
+            budget = f"/{self._max_attempts_seen}" if self._max_attempts_seen else ""
+            line.append(f"{icon} verify {self._attempts}{budget}\n", style=style)
+        if self._ctx_tokens and self._ctx_limit:
+            used = min(self._ctx_tokens / self._ctx_limit, 1.0)
+            filled = round(used * CTX_BAR_WIDTH)
+            bar_style = "bold red" if used > 0.85 else "bold cyan"
+            line.append("ctx ", style="dim")
+            line.append("▓" * filled, style=bar_style)
+            line.append("░" * (CTX_BAR_WIDTH - filled), style="dim")
+            line.append(
+                f" {self._fmt_tokens(self._ctx_tokens)}/{self._fmt_tokens(self._ctx_limit)}",
+                style="dim",
+            )
         self.query_one("#session", Static).update(line)
+
+    def _sync_status_from_node(self, data: dict[str, Any]) -> None:
+        """Pick up cockpit status (retry loop, context budget) from any node update."""
+
+        changed = False
+        if isinstance(data.get("attempts"), int):
+            self._attempts = data["attempts"]
+            changed = True
+        if isinstance(data.get("max_attempts"), int):
+            self._max_attempts_seen = data["max_attempts"]
+            changed = True
+        if isinstance(data.get("passed"), bool):
+            self._verify_passed = data["passed"]
+            changed = True
+        if isinstance(data.get("context_token_count"), int):
+            self._ctx_tokens = data["context_token_count"]
+            changed = True
+        if isinstance(data.get("context_token_limit"), int):
+            self._ctx_limit = data["context_token_limit"]
+            changed = True
+        if changed:
+            self._refresh_session_line()
+
+    def _set_active_agent(self, agent: str) -> None:
+        self._active_agent = agent
+        self._refresh_session_line()
+
+    @staticmethod
+    def _fmt_tokens(count: int) -> str:
+        if count < 1000:
+            return str(count)
+        if count % 1000 == 0:
+            return f"{count // 1000}k"
+        return f"{count / 1000:.1f}k"
 
     def _write_event(self, summary: str, detail: Any = None, kind: str = "system") -> None:
         if detail is not None and hasattr(detail, "__rich_console__"):
@@ -798,6 +873,7 @@ class LinkiTuiApp(App[None]):
             return
 
         if event_type == "handoff":
+            self._set_active_agent(str(event.get("to") or ""))
             self._write_event(
                 f"🔄 Handoff: {event.get('from')} → {event.get('to')}", detail=event, kind="handoff"
             )
@@ -841,6 +917,7 @@ class LinkiTuiApp(App[None]):
 
         if event_type == "subagent_start":
             agent = event.get("agent")
+            self._set_active_agent(str(agent or ""))
             description = event.get("description") or ""
             tools = event.get("tools") or []
             suffix = f" · tools: {', '.join(str(tool) for tool in tools)}" if tools else ""
@@ -848,6 +925,7 @@ class LinkiTuiApp(App[None]):
             return
 
         if event_type == "subagent_result":
+            self._set_active_agent("")
             prefix = self._subagent_prefix(event)
             summary = self._truncate(str(event.get("summary") or ""))
             self._write_event(f"{prefix}↩ Conclusion: {summary}", detail=event, kind="subagent")
@@ -866,6 +944,9 @@ class LinkiTuiApp(App[None]):
 
         if event_type == "session_saved":
             self._session_id = str(event.get("session_id") or self._session_id)
+            turn_index = event.get("turn_index")
+            if isinstance(turn_index, int):
+                self._turn_index = turn_index
             self._refresh_session_line()
             self._set_status(f"session: {self._session_id[:8]} | turn: {event.get('turn_index')}")
             return
@@ -880,7 +961,7 @@ class LinkiTuiApp(App[None]):
             route = event.get("route")
             prefix = f"💬 Final answer ({route})" if route else "💬 Final answer"
             self._write_event(prefix, detail=event, kind="success")
-            self.query_one("#final-body", Static).update(content or "No final answer.")
+            self._update_final_body(content)
             return
 
         if event_type == "error":
@@ -892,6 +973,7 @@ class LinkiTuiApp(App[None]):
             self._running_turn = False
             self.query_one("#input", Input).disabled = False
             self.query_one("#input", Input).focus()
+            self._active_agent = ""
             self._set_state("idle")
             self._set_status(f"idle | workspace: {self.workspace}")
             return
@@ -899,6 +981,9 @@ class LinkiTuiApp(App[None]):
     def _handle_node_update(self, event: dict[str, Any]) -> None:
         node = event.get("node")
         data = event.get("data") or {}
+
+        if isinstance(data, dict):
+            self._sync_status_from_node(data)
 
         if "todos" in data:
             self._update_plan_from_node(data)
@@ -932,9 +1017,12 @@ class LinkiTuiApp(App[None]):
             return
 
         if node == "final":
-            content = str(data.get("final_answer") or "")
-            self.query_one("#final-body", Static).update(content)
+            self._update_final_body(str(data.get("final_answer") or ""))
             return
+
+    def _update_final_body(self, content: str) -> None:
+        body = Markdown(content) if content.strip() else Text("No final answer.")
+        self.query_one("#final-body", Static).update(body)
 
     @staticmethod
     def _tool_detail(name: Any, args: Any) -> str:

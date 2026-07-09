@@ -7,7 +7,7 @@ from pathlib import Path
 
 from textual.widgets import Input, OptionList
 
-from Linki.cli.tui.app import LinkiTuiApp, _matching_commands
+from Linki.cli.tui.app import SLASH_COMMANDS, LinkiTuiApp, _matching_commands
 
 
 def _run(coro) -> None:
@@ -15,7 +15,7 @@ def _run(coro) -> None:
 
 
 def test_matching_commands_prefix_and_space() -> None:
-    assert [n for n, _ in _matching_commands("/")] == ["/plan", "/resume"]
+    assert [n for n, _ in _matching_commands("/")] == ["/plan", "/compact", "/memory", "/resume"]
     assert [n for n, _ in _matching_commands("/p")] == ["/plan"]
     assert [n for n, _ in _matching_commands("/r")] == ["/resume"]
     # Once arguments begin (a space), suggestions stop.
@@ -34,7 +34,7 @@ def test_menu_shows_filters_and_accepts(tmp_path: Path) -> None:
             await pilot.press("/")
             await pilot.pause()
             assert menu.display is True
-            assert menu.option_count == 2
+            assert menu.option_count == len(SLASH_COMMANDS)
 
             await pilot.press("p")
             await pilot.pause()

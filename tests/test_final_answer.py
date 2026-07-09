@@ -55,6 +55,7 @@ def test_tui_final_box_shows_real_answer(tmp_path: Path) -> None:
             app._handle_event({"type": "final_answer", "route": "workflow", "content": answer})
             await pilot.pause()
             body = app.query_one("#final-body", Static)
-            assert "艾欧泽亚售楼中心" in str(body.render())
+            # The final box renders markdown; the source markup must carry the answer.
+            assert "艾欧泽亚售楼中心" in body.content.markup
 
     asyncio.run(impl())
