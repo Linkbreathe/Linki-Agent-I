@@ -18,6 +18,12 @@ class RuntimeState:
     resume_from: Path | None = None
     event_handler: Callable[[dict[str, Any]], None] | None = None
     recent_files: OrderedDict[str, None] = field(default_factory=OrderedDict)
+    # Skills loaded for the current run. ``skills`` maps skill name -> SkillSpec
+    # (populated at run start); ``loaded_skills`` tracks which have had their full
+    # body disclosed via SkillTool so far this run. Both are cleared per run.
+    # Typed as ``Any`` values to avoid importing the skills package into core.
+    skills: dict[str, Any] = field(default_factory=dict)
+    loaded_skills: set[str] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "workspace", Path(self.workspace).expanduser().resolve())

@@ -14,6 +14,10 @@ from Linki.tools.web_search_tool import WebSearchTool
 # codeAgent pools but is never handed to a subagent (see agent_tool.run_subagent).
 AGENT_TOOL_NAME = "AgentTool"
 
+# The SkillTool discloses a named skill's full instructions on demand. Unlike
+# AgentTool it IS available to subagents that whitelist it in their definition.
+SKILL_TOOL_NAME = "SkillTool"
+
 # Every tool name an agent definition may reference. Agent definitions are
 # validated against this set at registry-load time so an unknown tool aborts
 # startup instead of failing silently at dispatch.
@@ -29,6 +33,7 @@ KNOWN_TOOL_NAMES = frozenset(
         "NotepadAppendTool",
         "MemoryUpsertTool",
         AGENT_TOOL_NAME,
+        SKILL_TOOL_NAME,
     }
 )
 
@@ -196,11 +201,16 @@ def build_subagent_tools(state: RuntimeState) -> list[StructuredTool]:
 
     ``run_subagent`` filters this pool down to the tools named in the agent
     definition's allowlist. Unlike :func:`build_tools`, this includes research
-    (WebSearchTool) and durable-notes (NotepadReadTool/NotepadAppendTool) tools,
-    but never the AgentTool — subagents cannot dispatch further subagents.
-    Every tool call still flows through :func:`execute_tool` so the hook,
-    risk-classification, and approval pipeline stays active inside subagents.
+    (WebSearchTool), durable-notes (NotepadReadTool/NotepadAppendTool), and the
+    progressive-disclosure SkillTool, but never the AgentTool — subagents cannot
+    dispatch further subagents. Every tool call still flows through
+    :func:`execute_tool` so the hook, risk-classification, and approval pipeline
+    stays active inside subagents.
     """
+
+    # Local import avoids a circular import: skill_tool imports SKILL_TOOL_NAME
+    # from this module at import time.
+    from Linki.tools.skill_tool import make_skill_tool
 
     web_search = WebSearchTool()
     notepad_read = NotepadReadTool(state)
@@ -231,6 +241,7 @@ def build_subagent_tools(state: RuntimeState) -> list[StructuredTool]:
             name="NotepadAppendTool",
             description="Append a durable note to the workspace NOTEPAD.md.",
         ),
+        make_skill_tool(state),
     ]
 
     return build_tools(state) + extra

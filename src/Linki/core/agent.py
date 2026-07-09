@@ -20,6 +20,7 @@ from Linki.core.session import (
 )
 from Linki.core.state import create_runtime
 from Linki.core.trace import TraceRecorder
+from Linki.skills.registry import load_skills_into_runtime
 from Linki.graph.workflow import build_complex_workflow, build_entry_workflow
 from Linki.providers.openai_provider import create_model
 
@@ -228,6 +229,8 @@ def stream_agent_events(
     )
     ensure_workspace(runtime, create=True)
     load_hooks_config(runtime)
+    # Populate the run's skill catalog and clear any prior run's disclosures.
+    load_skills_into_runtime(runtime)
 
     # Assemble the workspace's project context once per run; planner/codeAgent
     # prompt builders inject it from graph state.

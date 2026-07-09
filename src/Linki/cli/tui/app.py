@@ -931,6 +931,15 @@ class LinkiTuiApp(App[None]):
             self._write_event(f"{prefix}↩ Conclusion: {summary}", detail=event, kind="subagent")
             return
 
+        if event_type == "skill_load":
+            prefix = self._subagent_prefix(event)
+            tokens = event.get("tokens")
+            suffix = f" · ~{tokens} tokens" if isinstance(tokens, int) else ""
+            self._write_event(
+                f"{prefix}📚 Skill loaded: {event.get('name')}{suffix}", detail=event, kind="system"
+            )
+            return
+
         if event_type == "memory_extract":
             added = int(event.get("added") or 0)
             replaced = int(event.get("replaced") or 0)

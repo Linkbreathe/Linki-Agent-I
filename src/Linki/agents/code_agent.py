@@ -11,9 +11,11 @@ from Linki.graph.memory import LayeredMemory, build_layered_memory, format_layer
 from Linki.graph.state import TodoItem
 from Linki.providers.openai_provider import create_model
 from Linki.prompts.memory import AGENT_MEMORY_INSTRUCTIONS
+from Linki.skills.registry import render_available_skills
 from Linki.tools.agent_tool import make_agent_tool
 from Linki.tools.executor import is_tool_result
 from Linki.tools.registry import build_tools
+from Linki.tools.skill_tool import make_skill_tool
 
 CODE_AGENT_PROMPT = f"""You are codeAgent, a focused implementation specialist.
 
@@ -36,6 +38,8 @@ Rules:
   AgentTool. Available types are listed in <available_agents>. Give each
   dispatch a self-contained prompt because the subagent cannot see this
   conversation.
+- Before performing a task that matches a skill's description in
+  <available_skills>, call SkillTool to load its full instructions first.
 - BashTool already runs inside the workspace. Use relative paths, never "cd /workspace".
 - Incorporate research notes and source URLs when the task asks for researched content.
 - End with a concise summary of files changed and checks run.
@@ -173,6 +177,10 @@ def _code_agent_input(state: Any, instruction: str, memory: LayeredMemory) -> st
     if available_agents:
         parts.append(available_agents)
 
+    available_skills = render_available_skills(state)
+    if available_skills:
+        parts.append(available_skills)
+
     parts.append(format_layered_memory_for_prompt(memory))
 
     return "\n\n".join(parts)
@@ -238,9 +246,10 @@ def run_code_agent(
         plan_mode=bool(values.get("plan_mode")),
         ask_budget_left=values.get("ask_budget"),
     )
-    # codeAgent may dispatch specialist subagents (e.g. doc-writer, reviewer).
+    # codeAgent may dispatch specialist subagents (e.g. doc-writer, reviewer)
+    # and pull skill instructions on demand.
     if runtime is not None:
-        tools = tools + [make_agent_tool(state)]
+        tools = tools + [make_agent_tool(state), make_skill_tool(state)]
     tools_by_name = {tool.name: tool for tool in tools}
 
     todos = [_todo_dict(todo, index) for index, todo in enumerate(values.get("todos") or [])]

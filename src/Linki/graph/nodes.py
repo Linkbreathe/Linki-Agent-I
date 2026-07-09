@@ -23,6 +23,7 @@ from Linki.graph.memory import (
 )
 from Linki.graph.state import AgentHandoff, LinkiGraphState, TodoItem, VerificationCheck, VerificationResult
 from Linki.providers.openai_provider import create_model
+from Linki.skills.registry import render_available_skills
 from Linki.prompts.stage3 import (
     CHAT_RESPONDER_PROMPT,
     INTENT_ROUTER_PROMPT,
@@ -37,6 +38,7 @@ from Linki.tools.executor import is_tool_result
 from Linki.tools.memory_tools import make_memory_upsert_tool
 from Linki.tools.plan_tools import make_enter_plan_mode_tool, make_exit_plan_mode_tool
 from Linki.tools.registry import build_read_only_tools, build_tools
+from Linki.tools.skill_tool import make_skill_tool
 
 
 TODO_STATUSES = {"pending", "in_progress", "completed", "blocked"}
@@ -379,6 +381,8 @@ def _build_planner_tools(
         # subagents through the unified AgentTool.
         make_agent_tool(working),
         make_memory_upsert_tool(working),
+        # Pull a skill's full instructions on demand (progressive disclosure).
+        make_skill_tool(working),
     ]
 
     # A clarifying question is only offered while budget remains.
@@ -453,6 +457,9 @@ def _planner_input(working_state: Mapping[str, Any], memory: LayeredMemory) -> s
     available_agents = _available_agents_block(working_state)
     if available_agents:
         parts.append(available_agents)
+    available_skills = render_available_skills(working_state)
+    if available_skills:
+        parts.append(available_skills)
     parts.append(format_layered_memory_for_prompt(memory))
     return "\n\n".join(parts)
 

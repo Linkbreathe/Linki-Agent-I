@@ -12,8 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-import yaml
-
+from Linki.core.frontmatter import parse_frontmatter_markdown as _parse_frontmatter_markdown
 from Linki.core.state import RuntimeState
 from Linki.tools.registry import KNOWN_TOOL_NAMES
 
@@ -30,49 +29,23 @@ class AgentSpec:
 
 
 def parse_frontmatter_markdown(path: str | Path) -> AgentSpec:
-    """Parse a Markdown agent definition with YAML frontmatter into an AgentSpec."""
+    """Parse a Markdown agent definition with YAML frontmatter into an AgentSpec.
 
-    path = Path(path)
-    text = path.read_text(encoding="utf-8")
+    Delegates frontmatter parsing and required-field validation (name/tools) to
+    the shared :func:`Linki.core.frontmatter.parse_frontmatter_markdown`, then
+    applies the agent-specific ``tools`` list check and builds the AgentSpec.
+    """
 
-    lines = text.splitlines()
-    if not lines or lines[0].strip() != "---":
-        raise ValueError(f"agent definition {path} is missing YAML frontmatter")
-
-    end_index = None
-    for index, line in enumerate(lines[1:], start=1):
-        if line.strip() == "---":
-            end_index = index
-            break
-
-    if end_index is None:
-        raise ValueError(f"agent definition {path} has malformed frontmatter delimiters")
-
-    raw_yaml = "\n".join(lines[1:end_index])
-    body = "\n".join(lines[end_index + 1 :])
-
-    try:
-        meta = yaml.safe_load(raw_yaml)
-    except yaml.YAMLError as exc:
-        raise ValueError(f"agent definition {path} has invalid YAML frontmatter: {exc}") from exc
-
-    if not isinstance(meta, dict):
-        raise ValueError(f"agent definition {path} frontmatter must be a mapping")
-
-    name = meta.get("name")
-    tools = meta.get("tools")
-    if not name:
-        raise ValueError(f"agent definition {path} is missing required 'name'")
-    if tools is None:
-        raise ValueError(f"agent definition {path} is missing required 'tools'")
+    parsed = _parse_frontmatter_markdown(path, kind="agent")
+    tools = parsed.meta.get("tools")
     if not isinstance(tools, list):
-        raise ValueError(f"agent definition {path} 'tools' must be a list")
+        raise ValueError(f"agent definition {Path(path)} 'tools' must be a list")
 
     return AgentSpec(
-        name=str(name),
-        description=str(meta.get("description", "")),
+        name=str(parsed.meta["name"]),
+        description=str(parsed.meta.get("description", "")),
         tools=[str(tool) for tool in tools],
-        system_prompt=body.strip(),
+        system_prompt=parsed.body.strip(),
     )
 
 

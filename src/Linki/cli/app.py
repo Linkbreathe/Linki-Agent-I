@@ -611,6 +611,18 @@ def _print_event(event: dict, *, verbose: bool = False) -> None:
         )
         return
 
+    if event_type == "skill_load":
+        tokens = event.get("tokens")
+        detail = f"~{tokens} tokens" if isinstance(tokens, int) else ""
+        console.print(
+            Panel(
+                detail,
+                title=_subagent_title(event, f"📚 Skill loaded: {event.get('name')}"),
+                border_style="cyan",
+            )
+        )
+        return
+
     if event_type == "approval_requested":
         console.print(
             Panel(
